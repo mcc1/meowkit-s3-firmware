@@ -136,6 +136,21 @@ Two safeguards therefore run on every raw capture:
   protocols (Sony, RC5/RC6) never match the gate. A normalised entry carries a
   Flipper-safe comment line `# meowkit: marks normalised to <M0> us`.
 
+**Receiver limit and the Hitachi workaround (2026-09-06).** Measured on the
+owner's unit with two remotes: the receiver's output marks narrow by 20–30 %
+per ~165 ms of continuous carrier and vanish at ~200 ms. Protocols whose frame
+is split into bursts with ≥ 25 ms gaps (Daikin: 161 + 153 bits) capture fine;
+a single continuous frame longer than ~200 ms (Hitachi 264/296/344/424, some
+Mitsubishi/Fujitsu variants) can never be learned on this hardware, whatever
+the distance or battery. Air-conditioner remotes transmit the complete state
+(power, mode, temperature, fan, swing) on every press, so a frame can be
+*completed* instead of captured: `tools/complete-hitachi344.py` decodes the
+captured ~25 bytes of a HITACHI_AC344 (RAS-22NK) frame, fills the tail from
+the library's `IRHitachiAc344` layout, recomputes the inverted byte pairs and
+writes a device file with ON/OFF/mode variants. Verified on the owner's
+RAS-22NK: ON_COOL and OFF both accepted. A general solution (an IRac-based
+"AC Remote" mode that synthesises frames for ~50 brands) remains an option.
+
 ### Host unit tests
 
 `test/ir_codec/test_ir_codec.cpp` — self-contained assertions (no framework),
