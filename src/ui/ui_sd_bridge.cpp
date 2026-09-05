@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <SD_MMC.h>
+#include "../bsp/config.h"   /* HAL_PIN_SD_*, HAL_SD_FREQ_KHZ */
 #include <string.h>
 
 extern "C" int ui_sd_present(void)
@@ -17,7 +18,7 @@ extern "C" int ui_sd_present(void)
         /* Open failed: card may have been removed then reinserted.
          * Try to remount with the same parameters used at boot. */
         SD_MMC.end();
-        if (!SD_MMC.begin("/sdcard", true, false, 10000)) return 0;
+        if (!SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ)) return 0;
         root = SD_MMC.open("/");
         if (!root) return 0;
     }

@@ -11,6 +11,8 @@
 #include "devices.h"
 #include <driver/i2c.h>
 #include <driver/gpio.h>
+#include <esp_system.h>
+#include "../build_info.h"
 #if MEOWKIT_HW_TEST_ENABLE
 #include <IRsend.h>
 #include <IRrecv.h>
@@ -54,6 +56,29 @@ bool DEVICES::init()
     /* Serial — wait for monitor to connect */
     Serial.begin(9600);
     delay(300);
+
+    /* Why did we boot? Panics and watchdogs print their backtrace to UART0,
+     * which nobody watches on this board (Serial is USB CDC), so this line is
+     * the only post-mortem evidence a crash leaves behind. */
+    {
+        const esp_reset_reason_t rr = esp_reset_reason();
+        const char* name = "OTHER";
+        switch (rr) {
+            case ESP_RST_POWERON:  name = "POWERON";   break;
+            case ESP_RST_SW:       name = "SW";        break;
+            case ESP_RST_PANIC:    name = "PANIC";     break;
+            case ESP_RST_INT_WDT:  name = "INT_WDT";   break;
+            case ESP_RST_TASK_WDT: name = "TASK_WDT";  break;
+            case ESP_RST_WDT:      name = "WDT";       break;
+            case ESP_RST_DEEPSLEEP:name = "DEEPSLEEP"; break;
+            case ESP_RST_BROWNOUT: name = "BROWNOUT";  break;
+            case ESP_RST_SDIO:     name = "SDIO";      break;
+            case ESP_RST_EXT:      name = "EXT";       break;
+            default: break;
+        }
+        Serial.printf("[BOOT] reset reason %d (%s)\n", (int)rr, name);
+    }
+    Serial.printf("[BOOT] firmware %s  built %s  env %s\n", MK_BUILD_GIT, MK_BUILD_TIME, MK_BUILD_ENV);
 
     /* I2C bus */
     if (!In_I2C.begin(I2C_NUM_0, HAL_PIN_I2C_SDA, HAL_PIN_I2C_SCL)) {
@@ -1444,7 +1469,7 @@ skip_display:
 
             /* ════ Phase 1: Mount & Card Info ════ */
             SD_MMC.setPins(HAL_PIN_SD_CLK, HAL_PIN_SD_CMD, HAL_PIN_SD_D0);
-            bool mounted = SD_MMC.begin("/sdcard", true, false, 10000);
+            bool mounted = SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ);
             uint8_t cardType = mounted ? SD_MMC.cardType() : CARD_NONE;
             bool card_ok = mounted && (cardType != CARD_NONE);
 
@@ -1635,7 +1660,7 @@ skip_display:
                                 SD_MMC.end();
                                 delay(200);
                                 SD_MMC.setPins(HAL_PIN_SD_CLK, HAL_PIN_SD_CMD, HAL_PIN_SD_D0);
-                                bool rm = SD_MMC.begin("/sdcard", true, false, 10000);
+                                bool rm = SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ);
                                 uint8_t ct = rm ? SD_MMC.cardType() : CARD_NONE;
                                 if (rm && ct != CARD_NONE) {
                                     remount_pass++;
@@ -1644,7 +1669,7 @@ skip_display:
                                     Serial.printf("[BBT 10] Remount #%d FAIL\n", r + 1);
                                     /* Re-mount for cleanup */
                                     SD_MMC.setPins(HAL_PIN_SD_CLK, HAL_PIN_SD_CMD, HAL_PIN_SD_D0);
-                                    SD_MMC.begin("/sdcard", true, false, 10000);
+                                    SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ);
                                     break;
                                 }
                             }

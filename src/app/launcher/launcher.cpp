@@ -283,6 +283,27 @@ void Launcher::onLoop()
             lastSt = millis();
             power_tick();
             updateStatusBar();
+
+            /* MSC heartbeat: proves the app task is alive and shows whether the
+             * host is still issuing sector I/O. Printed from here, never from
+             * the TinyUSB task. */
+            if (usb_msc_is_active()) {
+                static uint32_t lastHb = 0;
+                if (millis() - lastHb >= 5000) {
+                    lastHb = millis();
+                    unsigned r = 0, e = 0; unsigned long cb = 0;
+                    unsigned long cbs = 0; unsigned long long sdus = 0; unsigned bsz = 0;
+                    usb_msc_stats(&r, &e, &cb);
+                    usb_msc_perf(&cbs, &sdus, &bsz);
+                    /* Throughput picture in one line: bytes, how many callbacks
+                     * they took (=> chunk size), and how much of the wall time
+                     * the SD card itself consumed. */
+                    Serial.printf("[MSC] hb bytes=%lu cbs=%lu last_bufsize=%u sd_ms=%lu retries=%u errors=%u last_cb=%s\n",
+                                  usb_msc_bytes_transferred(), cbs, bsz,
+                                  (unsigned long)(sdus / 1000ULL), r, e,
+                                  cb ? String(String((millis() - cb) / 1000) + "s ago").c_str() : "none");
+                }
+            }
             /* LED state: only active after boot grace; setEffect called on change only */
             _updateLed(_device, power_battery_pct(), power_is_charging());
 
@@ -363,9 +384,9 @@ void Launcher::initSD()
         return;
     }
 
-    /* Try mounting — single attempt at safe speed, max ~5s timeout */
-    Serial.printf("[Launcher] SD attempt @ 10MHz (1-bit)...\n");
-    bool mounted = SD_MMC.begin("/sdcard", true, false, 10000);
+    /* Try mounting — single attempt; see HAL_SD_FREQ_KHZ for why 20 MHz. */
+    Serial.printf("[Launcher] SD attempt @ %dMHz (1-bit)...\n", HAL_SD_FREQ_KHZ / 1000);
+    bool mounted = SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ);
 
     if (!mounted || SD_MMC.cardType() == CARD_NONE) {
         SD_MMC.end();

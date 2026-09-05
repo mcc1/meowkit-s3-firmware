@@ -53,6 +53,13 @@
 #define HAL_PIN_SD_CLK              47
 #define HAL_PIN_SD_CMD              48
 #define HAL_PIN_SD_D0               21
+/* SD bus clock for every SD_MMC.begin()/raw-SDMMC init, in kHz.
+ * Must be one of the rates ESP-IDF 4.4 actually applies (20000/26000/40000/
+ * 52000): sdmmc_init_host_frequency() ignores other values and leaves the card
+ * at the 400 kHz probing clock. The vendor's 10000 therefore ran every SD
+ * transfer at 400 kHz (measured 2026-09-06: 84 ms per 4 KB read). 20 MHz 1-bit
+ * showed zero CRC retries over a 12 MB USB-MSC session on this board. */
+#define HAL_SD_FREQ_KHZ             20000
 
 /* ═══════════════════════════════════════════════════════════════
  *  I2C — Shared bus (AXP173/PCA9557/FT6336/ES8311/ES7210/PCF8563/BMI270)
