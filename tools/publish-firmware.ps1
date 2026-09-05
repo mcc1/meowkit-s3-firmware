@@ -7,7 +7,11 @@ param(
 
     [switch]$SkipBuild,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [string]$InstallerRoot,
+
+    [string]$OutputRoot
 )
 
 Set-StrictMode -Version Latest
@@ -15,8 +19,15 @@ $ErrorActionPreference = 'Stop'
 
 $firmwareRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspaceRoot = (Resolve-Path (Join-Path $firmwareRoot '..')).Path
-$installerRoot = Join-Path $workspaceRoot 'meowkit-s3-installer'
-$buildRoot = Join-Path $firmwareRoot '.pio\build\esp32s3box'
+if ([string]::IsNullOrWhiteSpace($InstallerRoot)) {
+    $InstallerRoot = [IO.Path]::Combine($workspaceRoot, 'meowkit-s3-installer')
+}
+$installerRoot = $InstallerRoot
+if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
+    $OutputRoot = [IO.Path]::Combine($installerRoot, 'generated')
+}
+$outputRoot = $OutputRoot
+$buildRoot = [IO.Path]::Combine($firmwareRoot, '.pio', 'build', 'esp32s3box')
 
 function Invoke-External {
     param(
@@ -124,21 +135,15 @@ foreach ($artifact in @($bootloader, $partitions, $appFirmware)) {
 }
 
 if ($Channel -eq 'stable') {
-    $artifactDirectory = Join-Path $installerRoot "firmware\v$Version"
+    $artifactDirectory = [IO.Path]::Combine($outputRoot, 'stable')
     $artifactName = "meowkit-s3-v$Version-factory.bin"
-    $manifestPath = Join-Path $installerRoot 'stable\manifest.json'
+    $templatePath = [IO.Path]::Combine($installerRoot, 'templates', 'stable-manifest.json')
     $manifestName = 'MeowKit S3'
-    $manifestArtifactPath = "../firmware/v$Version/$artifactName"
-    $indexPattern = 'Latest stable version: v[0-9]+\.[0-9]+\.[0-9]+'
-    $indexReplacement = "Latest stable version: v$Version"
 } else {
-    $artifactDirectory = Join-Path $installerRoot 'firmware\local-test'
+    $artifactDirectory = [IO.Path]::Combine($outputRoot, 'local-test')
     $artifactName = 'meowkit-s3-local-test-factory.bin'
-    $manifestPath = Join-Path $installerRoot 'local-test\manifest.json'
+    $templatePath = [IO.Path]::Combine($installerRoot, 'templates', 'local-test-manifest.json')
     $manifestName = 'MeowKit S3 (local test build)'
-    $manifestArtifactPath = "../firmware/local-test/$artifactName"
-    $indexPattern = 'Local test build: [^<]+ \(experimental\)'
-    $indexReplacement = "Local test build: $Version (experimental)"
 }
 
 $factoryImage = Join-Path $artifactDirectory $artifactName
@@ -147,11 +152,14 @@ if ((Test-Path -LiteralPath $factoryImage -PathType Leaf) -and -not $Force) {
 }
 
 New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) {
+    throw "找不到 manifest template：$templatePath"
+}
 
 $userProfile = [Environment]::GetFolderPath('UserProfile')
 $esptoolCandidates = @(
-    (Join-Path $userProfile '.platformio\packages\tool-esptoolpy\esptool.py'),
-    (Join-Path $firmwareRoot '.pio\packages\tool-esptoolpy\esptool.py')
+    ([IO.Path]::Combine($userProfile, '.platformio', 'packages', 'tool-esptoolpy', 'esptool.py')),
+    ([IO.Path]::Combine($firmwareRoot, '.pio', 'packages', 'tool-esptoolpy', 'esptool.py'))
 )
 $esptool = $esptoolCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if ($null -eq $esptool) {
@@ -171,24 +179,34 @@ $mergeArguments = @(
 Invoke-External $python ($pythonPrefix + $mergeArguments)
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $factoryImage).Hash.ToLowerInvariant()
-$checksumsPath = Join-Path $artifactDirectory 'SHA256SUMS.txt'
-Set-Content -LiteralPath $checksumsPath -Value "$hash  $artifactName" -Encoding utf8
+$checksumsPath = [IO.Path]::Combine($artifactDirectory, 'SHA256SUMS.txt')
+$manifestPath = [IO.Path]::Combine($artifactDirectory, 'manifest.json')
+$metadataPath = [IO.Path]::Combine($artifactDirectory, 'metadata.json')
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+[IO.File]::WriteAllText($checksumsPath, "$hash  $artifactName`n", $utf8NoBom)
 
-$manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+$manifest = Get-Content -Raw -LiteralPath $templatePath | ConvertFrom-Json
 $manifest.name = $manifestName
 $manifest.version = $Version
-$manifest.builds[0].parts[0].path = $manifestArtifactPath
+$manifest.builds[0].parts[0].path = $artifactName
 $manifest.builds[0].parts[0].offset = 0
-Set-Content -LiteralPath $manifestPath -Value ($manifest | ConvertTo-Json -Depth 10) -Encoding utf8
+[IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 10) + [Environment]::NewLine, $utf8NoBom)
 
-$indexPath = Join-Path $installerRoot 'index.html'
-$index = Get-Content -Raw -LiteralPath $indexPath
-$updatedIndex = [regex]::Replace($index, $indexPattern, $indexReplacement, 1)
-if ($updatedIndex -eq $index -and $index -notmatch [regex]::Escape($indexReplacement)) {
-    throw "找不到 installer index 中預期的版本文字：$indexPattern"
+$firmwareCommit = (& $git -C $firmwareRoot rev-parse HEAD 2>$null).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($firmwareCommit)) {
+    throw "無法取得 firmware source commit：$firmwareRoot"
 }
-$updatedIndex = $updatedIndex.TrimEnd([char[]]@("`r", "`n")) + [Environment]::NewLine
-[IO.File]::WriteAllText($indexPath, $updatedIndex, [Text.UTF8Encoding]::new($false))
+$metadata = [ordered]@{
+    schemaVersion = 1
+    channel = $Channel
+    version = $Version
+    manifest = 'manifest.json'
+    artifact = $artifactName
+    sha256 = $hash
+    firmwareCommit = $firmwareCommit
+    generatedAt = (Get-Date).ToUniversalTime().ToString('o')
+}
+[IO.File]::WriteAllText($metadataPath, ($metadata | ConvertTo-Json -Depth 10) + [Environment]::NewLine, $utf8NoBom)
 
 Write-Host ''
 Write-Host '發布 artifact 已準備完成（尚未 commit、push、deploy 或 flash）：'
@@ -196,4 +214,5 @@ Write-Host "  Channel : $Channel"
 Write-Host "  Version : $Version"
 Write-Host "  Image   : $factoryImage"
 Write-Host "  SHA256  : $hash"
-Write-Host '若 local Web Installer 頁面已開啟，請重新整理瀏覽器以載入新的 manifest；HTTP server 不需要重啟。'
+Write-Host "  Metadata: $metadataPath"
+Write-Host 'index.html 不會被修改；local Web Installer 重新整理即可載入 generated metadata。'

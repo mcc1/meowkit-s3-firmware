@@ -53,7 +53,14 @@ Install Python, PlatformIO Core, and the ESP32-S3 platform used by
 
 This command initializes the submodules, checks their commits, builds the
 `esp32s3box` environment, creates a merged factory image at flash offset `0`,
-updates the local-test manifest and checksum, and updates the installer label.
+creates a channel manifest, metadata, and checksum under the installer's
+ignored `generated/` directory. It never edits the installer's `index.html`.
+
+The output directory can be overridden for CI packaging:
+
+```powershell
+.\tools\publish-firmware.ps1 -Channel local-test -OutputRoot .\ci-generated -Force
+```
 
 To prepare a stable version:
 
@@ -75,12 +82,10 @@ The following checks passed in this workspace:
 - A full `esp32s3box` PlatformIO build completed successfully with the pinned
   submodules.
 - `publish-firmware.ps1 -Channel local-test -Version
-  local-test-2026-09-05-symbol-keyboard -Force` completed the factory-image
-  packaging and updated the installer manifest and checksum.
-- The current local-test image is
-  `../meowkit-s3-installer/firmware/local-test/meowkit-s3-local-test-factory.bin`.
-  Its verified SHA256 is
-  `a402738fbfd0621c1fc6e40943ea3917be1c302a5188f435729f51f18e298945`.
+  local-test-2026-09-05-symbol-keyboard -Force` completed factory-image
+  packaging. The new output contract is the installer's
+  `generated/local-test/` directory containing the image, manifest, metadata,
+  and checksum.
 - PowerShell syntax checks passed for all three project tools.
 - `serial-monitor.ps1 -Port COM6 -BaudRate 9600` successfully opened the
   physical `COM6` during a short test. No serial output was observed during
