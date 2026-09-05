@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Port = 'COM6',
 
@@ -24,8 +24,9 @@ $serial = [System.IO.Ports.SerialPort]::new(
     [System.IO.Ports.StopBits]::One
 )
 $serial.ReadTimeout = 100
-$serial.DtrEnable = $false
-$serial.RtsEnable = $false
+# Native USB CDC only transmits after the host asserts both line states.
+$serial.DtrEnable = $true
+$serial.RtsEnable = $true
 
 $writer = $null
 try {
@@ -44,6 +45,7 @@ try {
         throw "無法開啟 $Port。請確認 MeowKit 在正常 firmware 模式、USB 線仍連接，並關閉其他 serial monitor。詳細錯誤：$($_.Exception.Message)"
     }
     Write-Host "Serial monitor connected: $Port @ $BaudRate baud"
+    Write-Host 'USB CDC handshake: DTR=true RTS=true'
     Write-Host '按 Ctrl+C 結束；若出現 Access denied，請先關閉其他佔用 COM port 的程式。'
 
     while ($true) {

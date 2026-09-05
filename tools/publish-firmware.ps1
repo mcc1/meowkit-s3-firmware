@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('local-test', 'stable')]
     [string]$Channel = 'local-test',
@@ -196,3 +196,4 @@ Write-Host "  Channel : $Channel"
 Write-Host "  Version : $Version"
 Write-Host "  Image   : $factoryImage"
 Write-Host "  SHA256  : $hash"
+Write-Host '若 local Web Installer 頁面已開啟，請重新整理瀏覽器以載入新的 manifest；HTTP server 不需要重啟。'

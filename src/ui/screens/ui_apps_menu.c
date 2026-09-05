@@ -95,15 +95,15 @@ static const struct {
     { &ui_img_retro_tv_png,    "Retro TV"    },
     { &ui_img_pc_montior_png,  "PC Monitor"  },
     { &ui_img_air_mouse_png,   "Air Mouse"   },
-    { &ui_img_music_png,       "Music"       },
     { &ui_img_ble_spam_png,    "BLE Spam"    },
-    { &ui_img_wifi_killer_png, "WiFi Killer" },
-    { &ui_img_badusb_png,      "BadUSB"      },
+    { &ui_img_badusb_png,      "Bad USB"     },
     { &ui_img_infrared_png,    "Infrared"    },
-    { &ui_img_nfc_png,         "app_12"      },
-    { &ui_img_smarthome_png,   "app_13"      },
-    { &ui_img_webserial_png,   "app_14"      },
-    { &ui_img_aichat_png,      "app_15"      },
+    { &ui_img_nfc_png,         "I2C Explorer"},
+    { &ui_img_nfc_png,         "app_11"      },
+    { &ui_img_smarthome_png,   "app_12"      },
+    { &ui_img_webserial_png,   "app_13"      },
+    { &ui_img_aichat_png,      "app_14"      },
+    { &ui_img_music_png,       "app_15"      },
 };
 
 /* 3 fixed column X positions */

@@ -51,7 +51,7 @@ inline void registerAllApps(mooncake::Mooncake& mc, DEVICES* dev)
     mc.installApp(std::make_unique<MOONCAKE::APPS::App07>(dev));     /* app_07  BLE Spam     */
     mc.installApp(std::make_unique<MOONCAKE::APPS::AppBadUSB>(dev)); /* app_08  Bad USB      */
     mc.installApp(std::make_unique<MOONCAKE::APPS::App09>(dev));     /* app_09  Infrared     */
-    mc.installApp(std::make_unique<MOONCAKE::APPS::App10>(dev));     /* app_10  stub         */
+    mc.installApp(std::make_unique<MOONCAKE::APPS::App10>(dev));     /* app_10  I2C Explorer */
     mc.installApp(std::make_unique<MOONCAKE::APPS::App11>(dev));     /* app_11  stub         */
     mc.installApp(std::make_unique<MOONCAKE::APPS::App12>(dev));     /* app_12  stub         */
     mc.installApp(std::make_unique<MOONCAKE::APPS::App13>(dev));     /* app_13  stub         */
@@ -75,7 +75,7 @@ static const void* const APP_BUILTIN_ICONS[] = {
     &ui_img_ble_spam_png,    /* app_07  BLE Spam    */
     &ui_img_badusb_png,      /* app_08  Bad USB     */
     &ui_img_infrared_png,    /* app_09  Infrared    */
-    &ui_img_wifi_killer_png, /* app_10  stub        */
+    &ui_img_nfc_png,         /* app_10  I2C Explorer (generic icon) */
     &ui_img_nfc_png,         /* app_11  stub        */
     &ui_img_smarthome_png,   /* app_12  stub        */
     &ui_img_webserial_png,   /* app_13  stub        */
