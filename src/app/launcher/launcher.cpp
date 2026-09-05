@@ -58,6 +58,7 @@
 #include "../../system/mk_events.h"
 #include <Arduino.h>
 #include <SD_MMC.h>
+#include "../../build_info.h"
 #include <lvgl.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
@@ -237,6 +238,10 @@ void Launcher::onCreate()
     Serial.printf("[Launcher] Ready — %d apps, heap=%lu\n\n",
                   (int)_mooncake.getAppNum(),
                   (unsigned long)esp_get_free_heap_size());
+    /* Repeat the identity here: the [BOOT] lines print before the host has
+     * enumerated the USB CDC port, so serial captures never see them. */
+    Serial.printf("[Launcher] firmware %s  built %s  reset=%d\n",
+                  MK_BUILD_GIT, MK_BUILD_TIME, (int)esp_reset_reason());
 }
 
 /* ── onLoop ────────────────────────────────────────── */
