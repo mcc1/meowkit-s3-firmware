@@ -30,13 +30,21 @@ static void _msc_status_cb(lv_timer_t * t)
     }
 
     unsigned long bytes = usb_msc_bytes_transferred();
-    char buf[48];
+    unsigned retries = 0, errors = 0; unsigned long lastcb = 0;
+    usb_msc_stats(&retries, &errors, &lastcb);
+    char buf[64];
+    /* A big FAT32 card makes the host read tens of MB of FAT before the
+     * drive opens; over Full-Speed USB that is about a minute. Say so, or
+     * users leave MSC half-way through the mount. */
     if(bytes == 0) {
-        lv_snprintf(buf, sizeof(buf), "connected");
+        lv_snprintf(buf, sizeof(buf), "connected - host mounting, wait");
     } else if(bytes < 1024UL * 1024UL) {
-        lv_snprintf(buf, sizeof(buf), "active  %lu KB", bytes / 1024UL);
+        lv_snprintf(buf, sizeof(buf), "active  %lu KB - wait for host", bytes / 1024UL);
+    } else if(lastcb && (lv_tick_get() - (uint32_t)lastcb) > 5000) {
+        lv_snprintf(buf, sizeof(buf), "%lu MB  idle %lus  r%u e%u", bytes / (1024UL * 1024UL),
+                    (unsigned long)((lv_tick_get() - (uint32_t)lastcb) / 1000), retries, errors);
     } else {
-        lv_snprintf(buf, sizeof(buf), "active  %lu MB", bytes / (1024UL * 1024UL));
+        lv_snprintf(buf, sizeof(buf), "active  %lu MB  r%u e%u", bytes / (1024UL * 1024UL), retries, errors);
     }
     lv_label_set_text(ui_usb_msc_label, buf);
 }

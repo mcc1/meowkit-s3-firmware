@@ -33,6 +33,7 @@ extern "C" {
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 }
 
 #include "../bsp/config.h"
@@ -53,19 +54,39 @@ static constexpr uint32_t kMscRetryDelay = 5;   /* ms between attempts */
 static volatile unsigned  s_retries      = 0;   /* diagnostics: retried ops */
 static volatile unsigned  s_errors       = 0;   /* diagnostics: failed ops */
 static volatile uint32_t  s_last_err_lba = 0;   /* diagnostics: last failing LBA */
+/* Shutdown handshake between the app task (usb_msc_disable) and the TinyUSB
+ * task (sector callbacks). Deinitialising the SDMMC host or freeing s_card
+ * while a read is in flight on the other task crashed the device when the
+ * user left MSC mode mid-transfer. */
+static volatile int       s_stopping     = 0;   /* refuse new sector I/O */
+static volatile unsigned long s_last_cb_ms = 0; /* millis() at the last sector callback */
+static volatile unsigned long s_cb_count   = 0; /* sector callbacks since enable() */
+static volatile unsigned long long s_sd_us = 0; /* time spent inside sdmmc_* calls */
+static volatile unsigned  s_last_bufsize   = 0; /* bytes requested by the last callback */
+static volatile int       s_cb_active    = 0;   /* callbacks currently inside sdmmc_* */
 
 static int32_t _msc_read_cb(uint32_t lba, uint32_t /*offset*/,
                               void * buf, uint32_t bufsize)
 {
-    if (!s_card) return -1;
-    for (int attempt = 1; attempt <= kMscRetries; attempt++) {
-        if (sdmmc_read_sectors(s_card, buf, lba, bufsize / 512) == ESP_OK) {
+    if (!s_card || s_stopping) return -1;
+    s_last_cb_ms = millis();
+    s_cb_count++;
+    s_last_bufsize = bufsize;
+    s_cb_active++;
+    for (int attempt = 1; attempt <= kMscRetries && !s_stopping; attempt++) {
+        const int64_t t0 = esp_timer_get_time();
+        const esp_err_t rc = sdmmc_read_sectors(s_card, buf, lba, bufsize / 512);
+        s_sd_us += (unsigned long long)(esp_timer_get_time() - t0);
+        if (rc == ESP_OK) {
             s_bytes += bufsize;
+            s_cb_active--;
             return (int32_t)bufsize;
         }
         s_retries++;
         if (attempt < kMscRetries) delay(kMscRetryDelay);
     }
+    s_cb_active--;
+    if (s_stopping) return -1;
     /* No Serial output here: this runs on the TinyUSB task, and a USB CDC
      * write spins until tud_task() drains the FIFO -- which is us. The
      * counters are reported from usb_msc_disable() on the app task. */
@@ -77,15 +98,25 @@ static int32_t _msc_read_cb(uint32_t lba, uint32_t /*offset*/,
 static int32_t _msc_write_cb(uint32_t lba, uint32_t /*offset*/,
                                uint8_t * buf, uint32_t bufsize)
 {
-    if (!s_card) return -1;
-    for (int attempt = 1; attempt <= kMscRetries; attempt++) {
-        if (sdmmc_write_sectors(s_card, buf, lba, bufsize / 512) == ESP_OK) {
+    if (!s_card || s_stopping) return -1;
+    s_last_cb_ms = millis();
+    s_cb_count++;
+    s_last_bufsize = bufsize;
+    s_cb_active++;
+    for (int attempt = 1; attempt <= kMscRetries && !s_stopping; attempt++) {
+        const int64_t t0 = esp_timer_get_time();
+        const esp_err_t rc = sdmmc_write_sectors(s_card, buf, lba, bufsize / 512);
+        s_sd_us += (unsigned long long)(esp_timer_get_time() - t0);
+        if (rc == ESP_OK) {
             s_bytes += bufsize;
+            s_cb_active--;
             return (int32_t)bufsize;
         }
         s_retries++;
         if (attempt < kMscRetries) delay(kMscRetryDelay);
     }
+    s_cb_active--;
+    if (s_stopping) return -1;
     /* No Serial output here: this runs on the TinyUSB task, and a USB CDC
      * write spins until tud_task() drains the FIFO -- which is us. The
      * counters are reported from usb_msc_disable() on the app task. */
@@ -113,18 +144,28 @@ int usb_msc_enable(void)
     s_errors  = 0;
     s_last_err_lba = 0;
     s_host_ejected = 0;
+    s_stopping     = 0;
+    s_cb_active    = 0;
+    s_last_cb_ms   = 0;
+    s_cb_count     = 0;
+    s_sd_us        = 0;
+    s_last_bufsize = 0;
 
     /* 1. Dismount FAT-FS — release exclusive SDMMC bus ownership */
     SD_MMC.end();
 
-    /* 2. Re-init SDMMC in 1-bit raw mode with the SAME bus clock the FAT
-     *    mount uses (Launcher::initSD: 1-bit, 10 MHz). The previous code ran
-     *    the raw session at SDMMC_FREQ_DEFAULT (20 MHz), twice the clock the
-     *    board is otherwise driven at; sustained MSC transfers then hit CRC
-     *    errors/timeouts that surfaced as an unstable USB drive. 1-bit at
-     *    10 MHz (~1.25 MB/s raw) still exceeds the Full-Speed USB ceiling. */
+    /* 2. Re-init SDMMC in 1-bit raw mode at SDMMC_FREQ_DEFAULT (20 MHz).
+     *
+     *    Do NOT "match" the FAT mount's 10000 kHz here. On the ESP-IDF 4.4
+     *    that this Arduino core ships, sdmmc_init_host_frequency() only
+     *    applies the standard rates (20/26/40/52 MHz); any other value leaves
+     *    the card at the 400 kHz probing clock. Measured on 2026-09-06 with
+     *    max_freq_khz = 10000: every 4 KB sector read took ~84 ms (= 4096 x 8
+     *    bits / 400 kbit/s), MSC throughput 41 KB/s, Windows needed ~8 min to
+     *    mount a 128 GB FAT32 card. 20 MHz is what the vendor firmware used
+     *    for MSC and is the lowest rate the driver actually honours. */
     sdmmc_host_t host  = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz  = 10000;                 /* 10 MHz, matches initSD */
+    host.max_freq_khz  = SDMMC_FREQ_DEFAULT;    /* 20 MHz (see note above) */
     host.slot          = SDMMC_HOST_SLOT_1;
     host.flags         = SDMMC_HOST_FLAG_1BIT;
 
@@ -183,7 +224,7 @@ int usb_msc_enable(void)
 
 fail_remount:
     SD_MMC.setPins(HAL_PIN_SD_CLK, HAL_PIN_SD_CMD, HAL_PIN_SD_D0);
-    SD_MMC.begin("/sdcard", true, false, 10000);
+    SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ);
     return 0;
 }
 
@@ -198,21 +239,30 @@ void usb_msc_disable(void)
     }
     if (!s_running) return;
 
-    /* Signal host: media removed (host unmounts the drive) */
+    /* 1. Refuse new sector I/O, tell the host the media is gone, then wait for
+     *    any callback still inside sdmmc_read/write_sectors() on the TinyUSB
+     *    task to return. The host keeps issuing reads for a moment after the
+     *    media-removed notification; tearing the host down under one of them
+     *    rebooted the device. */
+    s_stopping = 1;
     s_msc.mediaPresent(false);
+    for (int waited = 0; s_cb_active > 0 && waited < 2000; waited += 10) delay(10);
+    if (s_cb_active > 0) Serial.println("[MSC] warning: sector I/O still in flight at shutdown");
+    delay(50);              /* let the host see the media change before we vanish */
     s_msc.end();            /* clear callbacks + block info */
 
-    /* Release raw SDMMC resources */
+    /* 2. Release raw SDMMC resources */
     if (s_card) {
         sdmmc_host_deinit();
         free(s_card);
         s_card = nullptr;
     }
-    s_running = 0;
+    s_running  = 0;
+    s_stopping = 0;
 
     /* Remount FAT-FS for the rest of the firmware */
     SD_MMC.setPins(HAL_PIN_SD_CLK, HAL_PIN_SD_CMD, HAL_PIN_SD_D0);
-    if (!SD_MMC.begin("/sdcard", true, false, 10000)) {
+    if (!SD_MMC.begin("/sdcard", true, false, HAL_SD_FREQ_KHZ)) {
         Serial.println("[MSC] FS remount failed");
     } else {
         Serial.println("[MSC] FS remounted");
@@ -227,4 +277,18 @@ int usb_msc_is_active(void)
 unsigned long usb_msc_bytes_transferred(void)
 {
     return s_bytes;
+}
+
+void usb_msc_perf(unsigned long* callbacks, unsigned long long* sd_us_total, unsigned* last_bufsize)
+{
+    if (callbacks)    *callbacks    = s_cb_count;
+    if (sd_us_total)  *sd_us_total  = s_sd_us;
+    if (last_bufsize) *last_bufsize = s_last_bufsize;
+}
+
+void usb_msc_stats(unsigned* retries, unsigned* errors, unsigned long* last_cb_ms)
+{
+    if (retries)    *retries    = s_retries;
+    if (errors)     *errors     = s_errors;
+    if (last_cb_ms) *last_cb_ms = s_last_cb_ms;
 }

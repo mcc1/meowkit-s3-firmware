@@ -26,6 +26,13 @@ int  usb_msc_is_active(void);
 
 /** Cumulative bytes transferred (read + write) since last enable(). */
 unsigned long usb_msc_bytes_transferred(void);
+/** Diagnostics: retried sector ops, failed sector ops, millis() of the last
+ *  sector callback (0 = none yet). Any pointer may be NULL. */
+void usb_msc_stats(unsigned* retries, unsigned* errors, unsigned long* last_cb_ms);
+/** Throughput diagnostics: number of sector callbacks, microseconds spent
+ *  inside sdmmc_read/write_sectors() in total, and the byte size of the last
+ *  callback (tells how TinyUSB chunks host requests). Any pointer may be NULL. */
+void usb_msc_perf(unsigned long* callbacks, unsigned long long* sd_us_total, unsigned* last_bufsize);
 
 #ifdef __cplusplus
 }
