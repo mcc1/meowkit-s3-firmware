@@ -439,6 +439,10 @@ namespace MOONCAKE::APPS
         _prevScene  = _scene;
         _scene      = s;
         _sceneDirty = true;
+        /* A queued scene change always owns the next paint in full: leaving a
+         * stale _repaintOnly set would make the NEW scene's enter handler skip
+         * its rescan and draw the previous scene's cached rows. */
+        _repaintOnly = false;
         if (resetSel) { _sel = 0; _scrollTop = 0; }
     }
 
@@ -527,9 +531,12 @@ namespace MOONCAKE::APPS
     void App09::_serviceToast()
     {
         if (_toastUntil && millis() >= _toastUntil) {
-            _toastUntil  = 0;
-            _repaintOnly = true;     /* repaint wipes the banner, nothing else */
-            _sceneDirty  = true;
+            _toastUntil = 0;
+            /* Only claim the repaint when no scene change is already queued.
+             * Otherwise the incoming scene's enter handler would run with
+             * _repaintOnly set and reuse the outgoing scene's rows. */
+            if (!_sceneDirty) _repaintOnly = true;
+            _sceneDirty = true;
         }
     }
 
