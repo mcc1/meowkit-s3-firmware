@@ -12,12 +12,16 @@ project_dir = env.subst("$PROJECT_DIR")
 gif_path    = os.path.join(project_dir, "boot_animation.gif")
 splash_dir  = os.path.join(project_dir, "src", "splash")
 
+# Keep the generated assembly path-independent. The include path is used by
+# GNU AS to resolve the .incbin filename from the project root.
+env.Append(ASFLAGS=[f"-I{project_dir}"], ASPPFLAGS=[f"-I{project_dir}"])
+
 asm_out = os.path.join(splash_dir, "splash_gif_data.S")
 hdr_out = os.path.join(splash_dir, "splash_gif.h")
 
 gif_exists = os.path.isfile(gif_path)
 gif_size   = os.path.getsize(gif_path) if gif_exists else 0
-gif_fwd    = gif_path.replace("\\", "/")   # GAS requires forward slashes on Windows
+gif_name   = "boot_animation.gif"
 
 # ── build output ──────────────────────────────────────────────────────────────
 if gif_exists:
@@ -26,7 +30,7 @@ if gif_exists:
         "    .balign 4\n"
         "    .global splash_gif_data\n"
         "splash_gif_data:\n"
-        f'    .incbin "{gif_fwd}"\n'
+        f'    .incbin "{gif_name}"\n'
         "    .balign 4\n"
     )
     hdr_body = (
@@ -41,7 +45,7 @@ if gif_exists:
         "#endif\n\n"
         f"static const size_t splash_gif_len = {gif_size}u;\n"
     )
-    print(f"[embed_gif] {gif_fwd}  ({gif_size/1024:.1f} KB) → .incbin in Flash RODATA")
+    print(f"[embed_gif] {gif_name}  ({gif_size/1024:.1f} KB) → .incbin in Flash RODATA")
 
 else:
     # No GIF present — emit a zero-length symbol so the project still compiles.

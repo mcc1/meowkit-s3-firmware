@@ -73,10 +73,14 @@ static const char * t9_lower[9][5] = {
 
 static const char * number_map[9]  = {"1","2","3","4","5","6","7","8","9"};
 
-/* Symbol page 0 — common password / special chars (ASCII only) */
-static const char * sym_page0[9]   = {".", "!", "@", "#", "$", "%", "&", "*", "?"};
-/* Symbol page 1 — extended */
-static const char * sym_page1[9]   = {"-", "_", "(", ")", "+", "=", "/", "\"", "'"};
+/* All 32 printable ASCII punctuation characters, split across four pages. */
+static const int kSymbolPageCount = 4;
+static const char * sym_pages[4][9] = {
+    {".", "!", "@", "#", "$", "%", "&", "*", "?"},
+    {"-", "_", "(", ")", "+", "=", "/", "\"", "'"},
+    {",", ":", ";", "<", ">", "[", "\\", "]", "^"},
+    {"`", "{", "|", "}", "~", "", "", "", ""}
+};
 
 /* ═══════════════════════════════════════════════════════════════
  *  Internal helpers
@@ -98,11 +102,21 @@ static int _key_index(lv_obj_t * tgt)
 /* ── Refresh labels for current mode/page/case ─────────────── */
 static void _refresh_labels(void)
 {
+    lv_obj_t * order[9] = {
+        ui_matrix_4, ui_matrix_2, ui_matrix_3,
+        ui_matrix_1, ui_matrix_5, ui_matrix_6,
+        ui_matrix_7, ui_matrix_8, ui_matrix_9
+    };
+
     if(s_mode == MODE_LETTER) {
         static const char * lwr[9] = {"abc","def","ghi","jkl","mno","pqrs","tuv","wxyz"," "};
         static const char * upr[9] = {"ABC","DEF","GHI","JKL","MNO","PQRS","TUV","WXYZ"," "};
         const char ** t = s_upper ? upr : lwr;
-        for(int i = 0; i < 9; i++) lv_label_set_text(s_key_labels[i], t[i]);
+        for(int i = 0; i < 9; i++) {
+            lv_label_set_text(s_key_labels[i], t[i]);
+            lv_obj_clear_flag(s_key_labels[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_state(order[i], LV_STATE_DISABLED);
+        }
         /* Space key (index 8): white background */
         lv_obj_set_style_img_recolor(ui_matrix_9, lv_color_white(), 0);
         lv_obj_set_style_img_recolor_opa(ui_matrix_9, LV_OPA_COVER, 0);
@@ -114,7 +128,11 @@ static void _refresh_labels(void)
         if(s_space_bar) lv_obj_clear_flag(s_space_bar, LV_OBJ_FLAG_HIDDEN);
 
     } else if(s_mode == MODE_NUMBER) {
-        for(int i = 0; i < 9; i++) lv_label_set_text(s_key_labels[i], number_map[i]);
+        for(int i = 0; i < 9; i++) {
+            lv_label_set_text(s_key_labels[i], number_map[i]);
+            lv_obj_clear_flag(s_key_labels[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_state(order[i], LV_STATE_DISABLED);
+        }
         /* Restore space-key to normal image (shows "9" in number mode) */
         lv_obj_set_style_img_recolor_opa(ui_matrix_9, LV_OPA_TRANSP, 0);
         /* control_2: alphanumeric bg (same as 1–9), "0" with black text */
@@ -130,8 +148,18 @@ static void _refresh_labels(void)
         if(s_space_bar) lv_obj_add_flag(s_space_bar, LV_OBJ_FLAG_HIDDEN);
 
     } else { /* MODE_SYMBOL */
-        const char ** sym = (s_sym_page == 0) ? sym_page0 : sym_page1;
-        for(int i = 0; i < 9; i++) lv_label_set_text(s_key_labels[i], sym[i]);
+        const char ** sym = sym_pages[s_sym_page];
+        for(int i = 0; i < 9; i++) {
+            lv_label_set_text(s_key_labels[i], sym[i]);
+            if(sym[i][0] == '\0') {
+                /* Page 4 has five symbols; leave unused keys inert. */
+                lv_obj_add_flag(s_key_labels[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_state(order[i], LV_STATE_DISABLED);
+            } else {
+                lv_obj_clear_flag(s_key_labels[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_state(order[i], LV_STATE_DISABLED);
+            }
+        }
         /* Restore space-key background */
         lv_obj_set_style_img_recolor_opa(ui_matrix_9, LV_OPA_TRANSP, 0);
         /* control_2: dark bg, switch icon for page toggle — no pg text */
@@ -336,8 +364,8 @@ static void _key_cb(lv_event_t * e)
     if(s_mode == MODE_NUMBER) {
         lv_textarea_add_text(ui_input_textarea, number_map[idx]);
     } else if(s_mode == MODE_SYMBOL) {
-        const char ** sym = (s_sym_page == 0) ? sym_page0 : sym_page1;
-        lv_textarea_add_text(ui_input_textarea, sym[idx]);
+        const char * ch = sym_pages[s_sym_page][idx];
+        if(ch[0] != '\0') lv_textarea_add_text(ui_input_textarea, ch);
     } else {
         /* T9 multi-tap */
         if(idx == s_last_key) {
@@ -372,7 +400,7 @@ static void _ctrl2_cb(lv_event_t * e)
     if(s_mode == MODE_NUMBER) {
         if(ui_input_textarea) lv_textarea_add_text(ui_input_textarea, "0");
     } else if(s_mode == MODE_SYMBOL) {
-        s_sym_page = (s_sym_page == 0) ? 1 : 0;
+        s_sym_page = (s_sym_page + 1) % kSymbolPageCount;
         _refresh_labels();
     } else {
         s_upper = !s_upper;
