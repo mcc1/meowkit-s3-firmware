@@ -1,5 +1,26 @@
 # MeowKit-S3 Firmware
 
+This is a public personal derivative of the MeowKit-S3 firmware. It is not an
+official vendor release. The original upstream remote is kept as `origin`; the
+personal GitHub mirror is `mcc1/meowkit-s3-firmware`.
+
+## Personal modifications
+
+The public mirror documents and preserves the following local changes:
+
+- The Wi-Fi password keyboard includes the full printable ASCII punctuation
+  set, including characters such as `;`, `\\`, `{`, `|`, and `~`.
+- Firmware dependencies are recorded as pinned Git submodules so a fresh
+  checkout does not silently use floating revisions.
+- The splash GIF embedding path is portable across machines instead of pointing
+  to the original developer's absolute filesystem path.
+- PowerShell tools prepare local-test or stable installer artifacts and open a
+  serial monitor; they never flash a device or publish a release by themselves.
+
+These changes are provided so other MeowKit owners can inspect, reproduce, and
+adapt the work. Review the hardware and firmware risks before using a generated
+image.
+
 ## Reproducible source checkout
 
 This repository records the firmware dependencies as Git submodules. After a
@@ -82,6 +103,11 @@ The defaults are `COM6` and `9600` baud. Override them when needed:
 ```powershell
 .\tools\serial-monitor.ps1 -Port COM7 -BaudRate 115200 -LogPath .\logs\meowkit.log
 ```
+
+The script default follows the current `Serial.begin(9600)` call in
+`src/bsp/devices.cpp`. `platformio.ini` still declares `monitor_speed=115200`,
+so the baud-rate discrepancy remains to be resolved by an authoritative source
+or a device test; try the explicit `-BaudRate` override when diagnosing logs.
 
 Close this monitor before opening another program that needs the same COM port,
 including a PC Monitor telemetry sender or the browser installer.
