@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
+#include "usb_msc.h"
 
 static DeviceStatus s_status = {};
 
@@ -35,7 +36,10 @@ void device_status_update(DEVICES* dev)
     s_status.lcd_brightness = sys_get_brightness();
 
     /* ── SD card — active probe (hot-plug safe) ──────────────── */
-    {
+    /* While USB MSC owns the card the FAT volume is unmounted, so the probe
+     * would report "removed" and the launcher would run its SD-removed flow
+     * in the middle of a host transfer. Keep the last known value instead. */
+    if (!usb_msc_is_active()) {
         File f = SD_MMC.open("/");
         s_status.sd_present = (bool)f;
         if (f) f.close();
