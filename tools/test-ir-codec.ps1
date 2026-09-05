@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Builds and runs the host unit tests for src/app/app_09/ir_flipper_codec.cpp
-    and src/app/app_09/ir_raw_tools.cpp.
+    Builds and runs the host unit tests for src/app/app_09/ir_flipper_codec.cpp,
+    src/app/app_09/ir_raw_tools.cpp and src/app/app_11/ac_store.cpp.
 
 .DESCRIPTION
     Both modules are pure C++17 with no Arduino dependency, so they are compiled with
@@ -25,17 +25,18 @@ $ErrorActionPreference = 'Stop'
 $firmwareRoot = Split-Path -Parent $PSScriptRoot
 $src  = Join-Path $firmwareRoot 'src\app\app_09\ir_flipper_codec.cpp'
 $raw  = Join-Path $firmwareRoot 'src\app\app_09\ir_raw_tools.cpp'
+$acs  = Join-Path $firmwareRoot 'src\app\app_11\ac_store.cpp'
 $test = Join-Path $firmwareRoot 'test\ir_codec\test_ir_codec.cpp'
 $out  = Join-Path $firmwareRoot '.pio\host-tests'
 New-Item -ItemType Directory -Force $out | Out-Null
 $exe  = Join-Path $out 'test_ir_codec.exe'
 
-foreach ($f in @($src, $raw, $test)) {
+foreach ($f in @($src, $raw, $acs, $test)) {
     if (-not (Test-Path $f)) { throw "Missing source file: $f" }
 }
 
 if ($Compiler) {
-    & $Compiler -std=c++17 -Wall -Wextra -O1 -I (Join-Path $firmwareRoot 'src\app\app_09') $src $raw $test -o $exe
+    & $Compiler -std=c++17 -Wall -Wextra -O1 -I (Join-Path $firmwareRoot 'src\app\app_09') -I (Join-Path $firmwareRoot 'src\app\app_11') $src $raw $acs $test -o $exe
     if ($LASTEXITCODE -ne 0) { throw "Compile failed ($Compiler)" }
 } else {
     $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
@@ -45,8 +46,9 @@ if ($Compiler) {
     $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
     if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vsRoot" }
 
-    $inc = Join-Path $firmwareRoot 'src\app\app_09'
-    $cmd = "`"$vcvars`" >nul 2>&1 && cl /nologo /std:c++17 /EHsc /W4 /O1 /I`"$inc`" /Fo`"$out\\`" /Fe`"$exe`" `"$src`" `"$raw`" `"$test`""
+    $inc   = Join-Path $firmwareRoot 'src\app\app_09'
+    $incAc = Join-Path $firmwareRoot 'src\app\app_11'
+    $cmd = "`"$vcvars`" >nul 2>&1 && cl /nologo /std:c++17 /EHsc /W4 /O1 /I`"$inc`" /I`"$incAc`" /Fo`"$out\\`" /Fe`"$exe`" `"$src`" `"$raw`" `"$acs`" `"$test`""
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw 'Compile failed (MSVC)' }
 }

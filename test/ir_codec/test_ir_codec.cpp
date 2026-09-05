@@ -9,10 +9,12 @@
  * Vectors are the 24 VERIFIED rows of docs/app09-flipper-protocol-map.md
  * section 4, plus round-trip / property / range / name / hex tests, plus the
  * raw-capture helpers of src/app/app_09/ir_raw_tools.cpp (AGC fade detection
- * and period-preserving mark normalisation).
+ * and period-preserving mark normalisation), plus the App11 AC Remote config
+ * codec of src/app/app_11/ac_store.cpp (docs/app11-ac-remote.md section 3).
  */
 #include "ir_flipper_codec.h"
 #include "ir_raw_tools.h"
+#include "ac_store.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -522,6 +524,308 @@ static void testRawTools() {
     CHECK_EQ(fade.fadeUs, 0u, "healthy: no fade point");
 }
 
+
+/* ------------------------------------------------------- app_11 ac_store */
+
+/* String equality with the same failure reporting style as CHECK_EQ. */
+#define CHECK_STR(got, want, ctx)                                             \
+    do {                                                                      \
+        ++g_checks;                                                           \
+        const char* gs_ = (got);                                              \
+        const char* ws_ = (want);                                             \
+        if (std::strcmp(gs_, ws_) != 0) {                                     \
+            ++g_fails;                                                        \
+            if (g_fails <= kMaxPrinted)                                       \
+                std::printf("%s:%d: FAIL %s | %s  expected \"%s\", actual \"%s\"\n", \
+                            __FILE__, __LINE__, #got, (ctx), ws_, gs_);       \
+        }                                                                     \
+    } while (0)
+
+static void testAcStore() {
+    using namespace acstore;
+
+    /* 1. Round trip of a full file: the spec's own example (section 3),
+     *    preceded by the header comment serialise() writes. */
+    {
+        const char kFile[] =
+            "# MeowKit AC Remote device. Saving from the handheld rewrites this file\n"
+            "# from the keys below; any other key you add here is discarded.\n"
+            "protocol: HITACHI_AC344\n"
+            "model: -1\n"
+            "power: on\n"
+            "mode: cool\n"
+            "temp: 23\n"
+            "fan: auto\n"
+            "swingv: off\n"
+            "swingh: off\n"
+            "quiet: off\n"
+            "turbo: off\n"
+            "econo: off\n"
+            "light: off\n";
+        Device d;
+        CHECK_TRUE(parse(kFile, sizeof(kFile) - 1, d), "example: parsed");
+        CHECK_STR(d.protocol, "HITACHI_AC344", "example: protocol");
+        CHECK_EQ(d.model, (int16_t)-1, "example: model");
+        CHECK_TRUE(d.power, "example: power on");
+        CHECK_EQ(d.mode, kModeCool, "example: mode cool");
+        CHECK_EQ(d.temp, 23, "example: temp");
+        CHECK_EQ(d.fan, kFanAuto, "example: fan auto");
+        CHECK_EQ(d.swingv, kSwingOff, "example: swingv off");
+        CHECK_EQ(d.swingh, kSwingOff, "example: swingh off");
+
+        char buf[kFileBufSize];
+        const size_t n = serialise(d, buf, sizeof(buf));
+        CHECK_EQ(n, sizeof(kFile) - 1, "example: serialised length");
+        CHECK_STR(buf, kFile, "example: byte-identical round trip");
+
+        Device again;
+        CHECK_TRUE(parse(buf, n, again), "example: reparsed");
+        CHECK_STR(again.protocol, d.protocol, "reparse: protocol");
+        CHECK_EQ(again.mode, d.mode, "reparse: mode");
+        CHECK_EQ(again.temp, d.temp, "reparse: temp");
+        CHECK_EQ(again.power, d.power, "reparse: power");
+
+        /* The header is a comment, so a file written by hand without it
+         * parses to exactly the same device. */
+        const char* headerless = std::strstr(kFile, "protocol:");
+        CHECK_TRUE(headerless != nullptr, "example: header is separable");
+        Device bare;
+        parse(headerless, std::strlen(headerless), bare);
+        CHECK_STR(bare.protocol, d.protocol, "headerless: protocol");
+        CHECK_EQ(bare.mode, d.mode, "headerless: mode");
+        CHECK_EQ(bare.temp, d.temp, "headerless: temp");
+        CHECK_TRUE(std::strstr(kFile, kFileHeader) == kFile,
+                   "example: file opens with kFileHeader");
+    }
+
+    /* 2. A fully-populated non-default state also survives the round trip. */
+    {
+        Device d;
+        std::snprintf(d.protocol, sizeof(d.protocol), "%s", "DAIKIN216");
+        d.model = 3; d.power = true; d.mode = kModeHeat; d.temp = 30;
+        d.fan = kFanMax; d.swingv = kSwingAuto; d.swingh = kSwingAuto;
+        d.quiet = true; d.turbo = false; d.econo = true; d.light = true;
+
+        char buf[kFileBufSize];
+        const size_t n = serialise(d, buf, sizeof(buf));
+        CHECK_TRUE(n > 0, "daikin: serialised");
+        Device r;
+        CHECK_TRUE(parse(buf, n, r), "daikin: reparsed");
+        CHECK_STR(r.protocol, "DAIKIN216", "daikin: protocol");
+        CHECK_EQ(r.model, (int16_t)3, "daikin: model");
+        CHECK_EQ(r.mode, kModeHeat, "daikin: mode");
+        CHECK_EQ(r.temp, 30, "daikin: temp");
+        CHECK_EQ(r.fan, kFanMax, "daikin: fan");
+        CHECK_EQ(r.swingv, kSwingAuto, "daikin: swingv");
+        CHECK_EQ(r.swingh, kSwingAuto, "daikin: swingh");
+        CHECK_TRUE(r.quiet,  "daikin: quiet");
+        CHECK_FALSE(r.turbo, "daikin: turbo");
+        CHECK_TRUE(r.econo,  "daikin: econo");
+        CHECK_TRUE(r.light,  "daikin: light");
+    }
+
+    /* 3. Missing keys keep their defaults (only "protocol:" is present). */
+    {
+        const char kMinimal[] = "protocol: COOLIX\n";
+        Device d;
+        d.temp = 19;                       /* pre-set fields must be reset too */
+        CHECK_TRUE(parse(kMinimal, sizeof(kMinimal) - 1, d), "minimal: parsed");
+        CHECK_STR(d.protocol, "COOLIX", "minimal: protocol");
+        CHECK_EQ(d.model, (int16_t)-1, "minimal: model default");
+        CHECK_FALSE(d.power, "minimal: power default off");
+        CHECK_EQ(d.mode, kModeAuto, "minimal: mode default auto");
+        CHECK_EQ(d.temp, kTempDefault, "minimal: temp default");
+        CHECK_EQ(d.fan, kFanAuto, "minimal: fan default auto");
+        CHECK_EQ(d.swingv, kSwingOff, "minimal: swingv default off");
+        CHECK_EQ(d.swingh, kSwingOff, "minimal: swingh default off");
+        CHECK_FALSE(d.quiet || d.turbo || d.econo || d.light, "minimal: toggles off");
+    }
+
+    /* 4. Temperature is clamped to the app's 16..30 window, both ends. */
+    {
+        const char kHot[]  = "temp: 45\n";
+        const char kCold[] = "temp: -7\n";
+        Device hot, cold;
+        parse(kHot,  sizeof(kHot) - 1,  hot);
+        parse(kCold, sizeof(kCold) - 1, cold);
+        CHECK_EQ(hot.temp,  kTempMax, "clamp: 45 -> 30");
+        CHECK_EQ(cold.temp, kTempMin, "clamp: -7 -> 16");
+        CHECK_EQ(clampTemp(30), kTempMax, "clamp: 30 stays");
+        CHECK_EQ(clampTemp(16), kTempMin, "clamp: 16 stays");
+        CHECK_EQ(clampTemp(22), 22,       "clamp: in range untouched");
+    }
+
+    /* 5. Unknown keys are ignored and never disturb the keys around them. */
+    {
+        const char kExtra[] =
+            "protocol: GREE\n"
+            "sleep: 90\n"
+            "timer: 21\n"
+            "# a comment line\n"
+            "not a pair at all\n"
+            "temp: 27\n"
+            "beep: on\n"
+            "mode: dry\n";
+        Device d;
+        CHECK_TRUE(parse(kExtra, sizeof(kExtra) - 1, d), "unknown: parsed");
+        CHECK_STR(d.protocol, "GREE", "unknown: protocol survived");
+        CHECK_EQ(d.temp, 27, "unknown: temp survived");
+        CHECK_EQ(d.mode, kModeDry, "unknown: mode survived");
+        CHECK_FALSE(d.power, "unknown: power untouched");
+    }
+
+    /* 6. CRLF files (edited on a PC) parse exactly like LF ones, and a file
+     *    with no trailing newline still yields its last key. */
+    {
+        const char kCrlf[] =
+            "protocol: MIDEA\r\n"
+            "power: on\r\n"
+            "mode: heat\r\n"
+            "temp: 21\r\n"
+            "fan: high\r\n"
+            "swingv: auto";               /* no trailing newline on purpose */
+        Device d;
+        CHECK_TRUE(parse(kCrlf, sizeof(kCrlf) - 1, d), "crlf: parsed");
+        CHECK_STR(d.protocol, "MIDEA", "crlf: protocol has no stray CR");
+        CHECK_TRUE(d.power, "crlf: power");
+        CHECK_EQ(d.mode, kModeHeat, "crlf: mode");
+        CHECK_EQ(d.temp, 21, "crlf: temp");
+        CHECK_EQ(d.fan, kFanHigh, "crlf: fan");
+        CHECK_EQ(d.swingv, kSwingAuto, "crlf: last key without newline");
+    }
+
+    /* 7. A value the reader does not know falls back to the default; it never
+     *    corrupts the field nor aborts the rest of the file. */
+    {
+        const char kBad[] =
+            "protocol: SHARP_AC\n"
+            "mode: banana\n"
+            "fan: hurricane\n"
+            "swingv: sideways\n"
+            "power: maybe\n"
+            "temp: warm\n"
+            "quiet: on\n";
+        Device d;
+        CHECK_TRUE(parse(kBad, sizeof(kBad) - 1, d), "bad enum: parsed");
+        CHECK_EQ(d.mode, kModeAuto, "bad enum: mode -> auto");
+        CHECK_EQ(d.fan, kFanAuto, "bad enum: fan -> auto");
+        CHECK_EQ(d.swingv, kSwingOff, "bad enum: swingv -> off");
+        CHECK_EQ(d.swingh, kSwingOff, "bad enum: swingh default kept");
+        CHECK_FALSE(d.power, "bad enum: power -> off");
+        CHECK_EQ(d.temp, kTempDefault, "bad enum: non-numeric temp -> default");
+        CHECK_TRUE(d.quiet, "bad enum: later keys still read");
+    }
+
+    /* 7b. A bad swingh token does not disturb a good swingv on the same file,
+     *     and vice versa: each axis falls back on its own. */
+    {
+        const char kMixed[] =
+            "protocol: DAIKIN\n"
+            "swingv: auto\n"
+            "swingh: diagonal\n";
+        Device d;
+        CHECK_TRUE(parse(kMixed, sizeof(kMixed) - 1, d), "swingh: parsed");
+        CHECK_EQ(d.swingv, kSwingAuto, "swingh: good swingv survives");
+        CHECK_EQ(d.swingh, kSwingOff,  "swingh: bad token -> default off");
+
+        const char kMixed2[] = "swingv: upwards\nswingh: auto\n";
+        Device e;
+        parse(kMixed2, sizeof(kMixed2) - 1, e);
+        CHECK_EQ(e.swingv, kSwingOff,  "swingv: bad token -> default off");
+        CHECK_EQ(e.swingh, kSwingAuto, "swingv: good swingh survives");
+    }
+
+    /* 7c. `mode: off` is a real value (stdAc::opmode_t::kOff) and must survive
+     *     a Device-level round trip, power state included. */
+    {
+        Device d;
+        std::snprintf(d.protocol, sizeof(d.protocol), "%s", "PANASONIC_AC");
+        d.mode = kModeOff;
+        d.power = false;
+        d.temp = 18;
+        d.fan = kFanLow;
+        char buf[kFileBufSize];
+        const size_t n = serialise(d, buf, sizeof(buf));
+        CHECK_TRUE(n > 0, "mode off: serialised");
+        CHECK_TRUE(std::strstr(buf, "mode: off\n") != nullptr, "mode off: token written");
+        Device r;
+        CHECK_TRUE(parse(buf, n, r), "mode off: reparsed");
+        CHECK_EQ(r.mode, kModeOff, "mode off: round trip");
+        CHECK_FALSE(r.power, "mode off: power");
+        CHECK_EQ(r.temp, 18, "mode off: temp");
+        CHECK_EQ(r.fan, kFanLow, "mode off: fan");
+        CHECK_STR(r.protocol, "PANASONIC_AC", "mode off: protocol");
+    }
+
+    /* 7d. A protocol name longer than the field truncates safely: no overrun,
+     *     still NUL-terminated, and the truncated text is not a real protocol
+     *     name, so the app resolves it to UNKNOWN and refuses to send. */
+    {
+        const char kLong[] =
+            "protocol: MITSUBISHI_HEAVY_152_EXTENDED_EDITION\n"
+            "temp: 24\n";
+        Device d;
+        CHECK_TRUE(parse(kLong, sizeof(kLong) - 1, d), "long protocol: parsed");
+        CHECK_EQ(std::strlen(d.protocol), kProtocolLen - 1, "long protocol: truncated");
+        CHECK_EQ((int)d.protocol[kProtocolLen - 1], 0, "long protocol: terminated");
+        CHECK_TRUE(std::strncmp(d.protocol, "MITSUBISHI_HEAVY_152_EXT",
+                                kProtocolLen - 1) == 0,
+                   "long protocol: keeps the leading bytes");
+        CHECK_EQ(d.temp, 24, "long protocol: following keys still read");
+
+        /* And it survives serialise() without growing the field. */
+        char buf[kFileBufSize];
+        const size_t n = serialise(d, buf, sizeof(buf));
+        Device r;
+        parse(buf, n, r);
+        CHECK_STR(r.protocol, d.protocol, "long protocol: stable round trip");
+    }
+
+    /* 8. Token tables: every name round-trips through its parser, the UI
+     *    labels are never empty, and keys/values are case-insensitive. */
+    {
+        const int8_t modes[] = { kModeOff, kModeAuto, kModeCool, kModeHeat,
+                                 kModeDry, kModeFan };
+        for (int8_t m : modes) {
+            CHECK_EQ(parseMode(modeName(m), kModeAuto), m, "token: mode round trip");
+            CHECK_TRUE(modeLabel(m)[0] != '\0', "token: mode label non-empty");
+        }
+        const int8_t fans[] = { kFanAuto, kFanMin, kFanLow, kFanMedium,
+                                kFanHigh, kFanMax };
+        for (int8_t f : fans) {
+            CHECK_EQ(parseFan(fanName(f), kFanAuto), f, "token: fan round trip");
+            CHECK_TRUE(fanLabel(f)[0] != '\0', "token: fan label non-empty");
+        }
+        CHECK_EQ(parseSwing(swingName(kSwingOff),  kSwingAuto), kSwingOff,  "token: swing off");
+        CHECK_EQ(parseSwing(swingName(kSwingAuto), kSwingOff),  kSwingAuto, "token: swing auto");
+        CHECK_TRUE(parseBool(boolName(true), false),  "token: bool on");
+        CHECK_FALSE(parseBool(boolName(false), true), "token: bool off");
+
+        const char kUpper[] = "PROTOCOL: LG2\nMODE: COOL\nPOWER: ON\n";
+        Device d;
+        parse(kUpper, sizeof(kUpper) - 1, d);
+        CHECK_STR(d.protocol, "LG2", "case: protocol");
+        CHECK_EQ(d.mode, kModeCool, "case: mode");
+        CHECK_TRUE(d.power, "case: power");
+    }
+
+    /* 9. serialise() refuses a buffer it cannot fill and leaves it empty. */
+    {
+        Device d;
+        std::snprintf(d.protocol, sizeof(d.protocol), "%s", "KELVINATOR");
+        char tiny[16] = { 'x', '\0' };
+        CHECK_EQ(serialise(d, tiny, sizeof(tiny)), (size_t)0, "tiny buffer refused");
+        CHECK_EQ((int)tiny[0], 0, "tiny buffer cleared");
+
+        Device blank;
+        char buf[kFileBufSize];
+        CHECK_TRUE(serialise(blank, buf, sizeof(buf)) > 0, "blank: serialised");
+        Device back;
+        parse(buf, std::strlen(buf), back);
+        CHECK_STR(back.protocol, "UNKNOWN", "blank: protocol placeholder");
+    }
+}
+
 int main() {
     testVectorsForward();
     testVectorsRoundTrip();
@@ -532,6 +836,7 @@ int main() {
     testNames();
     testHexBytes();
     testRawTools();
+    testAcStore();
 
     std::printf("ir_codec: %lld checks, %lld failures (%lld ext frames skipped as "
                 "documented NEC/NEC42 aliases)\n", g_checks, g_fails, g_aliased);
