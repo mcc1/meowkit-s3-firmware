@@ -15,6 +15,12 @@ remote when it is configured locally.
   independent of the original developer's filesystem path.
 - `tools/publish-firmware.ps1` builds and packages installer artifacts without
   flashing, committing, pushing, deploying, or creating a hosted release.
+- `src/app/app_09/` (Infrared) was rewritten in September 2026 against
+  `docs/app09-infrared-redesign.md`; the Flipper `.ir` <-> IRremoteESP8266
+  bit rules are in `docs/app09-flipper-protocol-map.md`. Read the spec before
+  changing the app. `src/app/app_09/ir_flipper_codec.*` must stay free of
+  Arduino headers so `tools/test-ir-codec.ps1` (MSVC host unit tests, no
+  PlatformIO) keeps running; run it after any codec change.
 - `tools/serial-monitor.ps1` defaults to `COM6` at `9600` baud because the
   current source calls `Serial.begin(9600)`. `platformio.ini` still declares
   `monitor_speed=115200`; keep this discrepancy explicit until authoritative

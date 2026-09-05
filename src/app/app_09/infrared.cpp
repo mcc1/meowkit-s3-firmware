@@ -1,49 +1,30 @@
 /**
- * @file app_11.cpp
+ * @file infrared.cpp
  * @author Mingo
  * @brief App09 — Infrared (Flipper-style TUI)
- *   Main Menu → Learn / Saved Remotes / Universal Remote
- *   File format: Flipper-compatible .ir
- *   TUI: 翠绿 + 白色色调, 方向键 + A/B 输入
- * @version 1.0
- * @date 2025-08-05
+ *          MainMenu → Learn / Remotes / Universal (all brands)
+ *        A device file is a container; its signals are its buttons.
+ *        Storage: Flipper-compatible .ir (ir_store.{h,cpp})
+ *        Codec  : (protocol, address, command) <-> IRsend (ir_flipper_codec.h)
+ *        Contract: docs/app09-infrared-redesign.md §2 §4 §5
+ * @version 2.0
+ * @date 2026-09-05
  * @copyright Copyright (c) 2025
  */
 #include "infrared.h"
 #include "../../bsp/config.h"
 #include "../app_common/hp_ui.h"
+#include "ir_raw_tools.h"
+
+#include <cstdarg>
 
 /* ── Layout constants (bound to hp_ui shared chrome) ── */
-static constexpr int SCR_W         = hp::W;
-static constexpr int SCR_H         = hp::H;
-static constexpr int HDR_H         = hp::CON_Y0;
-static constexpr int FTR_H         = hp::H - hp::FTR_SEP;
-static constexpr int ITEM_H        = hp::ITEM_H;           // 24 px — single-line
-static constexpr int ITEM2_H       = hp::ITEM2_H;          // 34 px — two-line (BLE/BadUSB style)
-static constexpr int MENU_Y0       = hp::CON_Y0 + 2;
-static constexpr int MENU_VISIBLE  = hp::LIST_VIS;         // 7 rows (single-line)
-static constexpr int MENU2_VISIBLE = hp::LIST2_VIS;        // 5 rows (two-line)
+static constexpr int MENU_Y0 = hp::CON_Y0 + 2;
 
-static constexpr const char* IR_DIR = "/infrared";
 static constexpr const char* IR_LEARN_ICON_PATH = "/assets/ir_icon.png";
 
-/* ── Universal Remote directory (SD card: /infrared/universal/) ── */
-static constexpr const char* UNIV_DIR      = "/infrared/universal";
 /* Known category count — indices 0-8 map to kVBtnsDefs[], projectors alias=2 */
-static constexpr int          kUnivKnownCount = 9;
-
-/* Subtitle for each known category (index matches kVBtnsDefs[]) */
-static const char* kUnivSubtitles[] = {
-    "Television",       // 0 tv
-    "Air conditioner",  // 1 ac
-    "Projector",        // 2 projector / projectors
-    "Audio system",     // 3 audio
-    "Blu-ray / DVD",    // 4 bluray_dvd
-    "Digital signage",  // 5 digital_sign
-    "Fan control",      // 6 fans
-    "LED strip",        // 7 leds
-    "PC monitor",       // 8 monitor
-};
+static constexpr int kUnivKnownCount = 9;
 
 /* Map filename stem → category index; -1 = generic */
 static int univCatIndex(const char* stem) {
@@ -60,12 +41,16 @@ static int univCatIndex(const char* stem) {
     return -1;
 }
 
+/* Strip the extension from a file name. */
+static String stemOf(const String& filename) {
+    int dot = filename.lastIndexOf('.');
+    return (dot >= 0) ? filename.substring(0, dot) : filename;
+}
+
 /* Make a display label from a filename: strip .ir, replace _ with space,
  * short names (≤3 chars) are fully uppercased, longer ones capitalize first. */
 static String univDisplayName(const String& filename) {
-    String n = filename;
-    int dot = n.lastIndexOf('.');
-    if (dot >= 0) n = n.substring(0, dot);
+    String n = stemOf(filename);
     n.replace("_", " ");
     if (n.length() <= 3) { n.toUpperCase(); }
     else if (n.length() > 0) { n.setCharAt(0, toupper((unsigned char)n.charAt(0))); }
@@ -77,76 +62,88 @@ static String univDisplayName(const String& filename) {
  *    Index matches univCatIndex(): TV=0 AC=1 Proj=2 Audio=3 BDvd=4
  *                                  Sign=5 Fan=6 LED=7 Mon=8
  * ── */
-struct VBtnDef { const char* label; const char* sigName; };
+struct VBtnDef {
+    const char* label;
+    const char* names[3];   /* candidate signal names, nullptr-terminated */
+};
 
-/* 0 — TV */
+/* Each button carries up to three candidate signal names; the first one the
+ * indexed file actually contains wins (case-insensitive). The bundled library
+ * spells the same function differently per category (Eject vs Open_Close,
+ * Rotate vs Swing, SOURCE vs Input_next), and a button with no counterpart in
+ * its file was dropped or relabelled — every button below resolves against
+ * "sd files/infrared/universal/". */
+
+/* 0 — TV  (tv.ir: Power Mute Vol_up Vol_dn Ch_next Ch_prev) */
 static const VBtnDef kVBtns_TV[] = {
-    {"POWER",  "Power"},    {"MUTE",   "Mute"},
-    {"VOL +",  "Vol_up"},   {"CH +",   "Ch_next"},
-    {"VOL -",  "Vol_dn"},   {"CH -",   "Ch_prev"},
+    {"POWER",  {"Power",   nullptr, nullptr}}, {"MUTE",  {"Mute",    nullptr, nullptr}},
+    {"VOL +",  {"Vol_up",  nullptr, nullptr}}, {"CH +",  {"Ch_next", "Ch_up",   nullptr}},
+    {"VOL -",  {"Vol_dn",  nullptr, nullptr}}, {"CH -",  {"Ch_prev", "Ch_dn",   nullptr}},
 };
 static constexpr int kVBtns_TV_N = 6;
 
-/* 1 — AC */
+/* 1 — AC  (ac.ir: Off Dh Cool_hi Cool_lo Heat_hi Heat_lo) */
 static const VBtnDef kVBtns_AC[] = {
-    {"OFF",     "Off"},      {"DRY",     "Dh"},
-    {"COOL ^",  "Cool_hi"},  {"HEAT ^",  "Heat_hi"},
-    {"COOL v",  "Cool_lo"},  {"HEAT v",  "Heat_lo"},
+    {"OFF",    {"Off",     nullptr, nullptr}}, {"DRY",    {"Dh",      "Dry",  nullptr}},
+    {"COOL ^", {"Cool_hi", nullptr, nullptr}}, {"HEAT ^", {"Heat_hi", nullptr, nullptr}},
+    {"COOL v", {"Cool_lo", nullptr, nullptr}}, {"HEAT v", {"Heat_lo", nullptr, nullptr}},
 };
 static constexpr int kVBtns_AC_N = 6;
 
-/* 2 — Projector (reused for projectors) */
+/* 2 — Projector  (projector.ir / projectors.ir: Power Mute Vol_up Vol_dn) */
 static const VBtnDef kVBtns_Proj[] = {
-    {"POWER",  "Power"},    {"MUTE",   "Mute"},
-    {"VOL +",  "Vol_up"},   {"VOL -",  "Vol_dn"},
+    {"POWER",  {"Power",   nullptr, nullptr}}, {"MUTE",  {"Mute",   nullptr, nullptr}},
+    {"VOL +",  {"Vol_up",  nullptr, nullptr}}, {"VOL -", {"Vol_dn", nullptr, nullptr}},
 };
 static constexpr int kVBtns_Proj_N = 4;
 
-/* 3 — Audio system */
+/* 3 — Audio system  (audio.ir: 8/8 present) */
 static const VBtnDef kVBtns_Audio[] = {
-    {"POWER",  "Power"},    {"MUTE",   "Mute"},
-    {"VOL +",  "Vol_up"},   {"VOL -",  "Vol_dn"},
-    {"PLAY",   "Play"},     {"PAUSE",  "Pause"},
-    {"NEXT",   "Next"},     {"PREV",   "Prev"},
+    {"POWER",  {"Power", nullptr, nullptr}}, {"MUTE",  {"Mute",   nullptr, nullptr}},
+    {"VOL +",  {"Vol_up", nullptr, nullptr}}, {"VOL -", {"Vol_dn", nullptr, nullptr}},
+    {"PLAY",   {"Play",  nullptr, nullptr}}, {"PAUSE", {"Pause",  nullptr, nullptr}},
+    {"NEXT",   {"Next",  nullptr, nullptr}}, {"PREV",  {"Prev",   nullptr, nullptr}},
 };
 static constexpr int kVBtns_Audio_N = 8;
 
-/* 4 — Blu-ray / DVD */
+/* 4 — Blu-ray / DVD  (bluray_dvd.ir: Power Eject Play Pause Fast_fo Fast_ba Ok
+ *   Subtitle — Stop/Mute/Next/Prev do not exist in the file and were replaced) */
 static const VBtnDef kVBtns_BDvd[] = {
-    {"POWER",  "Power"},    {"EJECT",  "Open_Close"},
-    {"PLAY",   "Play"},     {"PAUSE",  "Pause"},
-    {"STOP",   "Stop"},     {"MUTE",   "Mute"},
-    {"NEXT",   "Next"},     {"PREV",   "Prev"},
+    {"POWER",  {"Power",   nullptr,      nullptr}}, {"EJECT", {"Eject",   "Open_Close", nullptr}},
+    {"PLAY",   {"Play",    nullptr,      nullptr}}, {"PAUSE", {"Pause",   nullptr,      nullptr}},
+    {"FWD",    {"Fast_fo", "Next",       nullptr}}, {"REW",   {"Fast_ba", "Prev",       nullptr}},
+    {"OK",     {"Ok",      "Enter",      nullptr}}, {"SUB",   {"Subtitle", nullptr,     nullptr}},
 };
 static constexpr int kVBtns_BDvd_N = 8;
 
-/* 5 — Digital signage */
+/* 5 — Digital signage  (digital_sign.ir: POWER SOURCE PLAY STOP) */
 static const VBtnDef kVBtns_Sign[] = {
-    {"POWER",  "Power"},    {"MUTE",   "Mute"},
-    {"VOL +",  "Vol_up"},   {"VOL -",  "Vol_dn"},
+    {"POWER",  {"Power", nullptr,      nullptr}}, {"SOURCE", {"Source", "Input_next", "Input"}},
+    {"PLAY",   {"Play",  nullptr,      nullptr}}, {"STOP",   {"Stop",   nullptr,      nullptr}},
 };
 static constexpr int kVBtns_Sign_N = 4;
 
-/* 6 — Fans */
+/* 6 — Fans  (fans.ir: Power Rotate Speed_up Speed_dn Mode Timer) */
 static const VBtnDef kVBtns_Fan[] = {
-    {"POWER",  "Power"},    {"SWING",  "Swing"},
-    {"SPD +",  "Speed_up"}, {"SPD -",  "Speed_dn"},
-    {"SLEEP",  "Sleep"},    {"TIMER",  "Timer"},
+    {"POWER",  {"Power",    nullptr,  nullptr}}, {"SWING", {"Rotate", "Swing",  nullptr}},
+    {"SPD +",  {"Speed_up", nullptr,  nullptr}}, {"SPD -", {"Speed_dn", nullptr, nullptr}},
+    {"MODE",   {"Mode",     "Sleep",  nullptr}}, {"TIMER", {"Timer",  nullptr,  nullptr}},
 };
 static constexpr int kVBtns_Fan_N = 6;
 
-/* 7 — LED strips */
+/* 7 — LED strips  (leds.ir: Power_on Power_off Brightness_up/dn Red Green Blue White) */
 static const VBtnDef kVBtns_LED[] = {
-    {"POWER",  "Power"},       {"FLASH",   "Flash"},
-    {"BRT +",  "Brightness_up"},{"BRT -",  "Brightness_dn"},
-    {"STROBE", "Strobe"},      {"SMOOTH",  "Smooth"},
+    {"ON",     {"Power_on",       "Power", nullptr}}, {"OFF",   {"Power_off", nullptr, nullptr}},
+    {"BRT +",  {"Brightness_up",  nullptr, nullptr}}, {"BRT -", {"Brightness_dn", nullptr, nullptr}},
+    {"RED",    {"Red",            nullptr, nullptr}}, {"GREEN", {"Green",     nullptr, nullptr}},
+    {"BLUE",   {"Blue",           nullptr, nullptr}}, {"WHITE", {"White",     nullptr, nullptr}},
 };
-static constexpr int kVBtns_LED_N = 6;
+static constexpr int kVBtns_LED_N = 8;
 
-/* 8 — PC monitor */
+/* 8 — PC monitor  (monitor.ir: POWER SOURCE MENU EXIT) */
 static const VBtnDef kVBtns_Mon[] = {
-    {"POWER",  "Power"},       {"INPUT",  "Input_next"},
-    {"BRT +",  "Brightness_up"},{"BRT -", "Brightness_dn"},
+    {"POWER",  {"Power", nullptr,      nullptr}}, {"SOURCE", {"Source", "Input_next", "Input"}},
+    {"MENU",   {"Menu",  nullptr,      nullptr}}, {"EXIT",   {"Exit",   "Back",       nullptr}},
 };
 static constexpr int kVBtns_Mon_N = 4;
 
@@ -162,15 +159,31 @@ static const int kVBtnsCount[] = {
     kVBtns_Fan_N, kVBtns_LED_N, kVBtns_Mon_N,
 };
 
+/* First alias present in the index wins; -1 when the file has none of them. */
+static int univFindAlias(const irstore::Index& index, const VBtnDef& def)
+{
+    for (int i = 0; i < 3; i++) {
+        if (!def.names[i]) break;
+        int slot = index.find(def.names[i]);
+        if (slot >= 0) return slot;
+    }
+    return -1;
+}
+
+/* TV-B-Gone is the extra last button of the TV category. */
+static constexpr int kUnivCatTV     = 0;
+static constexpr const char* kTvbgLabel = "TV-B-GONE";
+
 /* Compute button rect for a 2-column grid within the content area.
  *   Area: x=5..314, y=CON_Y0+4..CON_Y1-4.  GAP=6 between buttons. */
 static void _getVBtnRect(int idx, int numBtns,
-                          int& bx, int& by, int& bw, int& bh)
+                         int& bx, int& by, int& bw, int& bh)
 {
     const int GAP = 6, AX = 5, AY = hp::CON_Y0 + 4;
     const int AW  = hp::W - 10;
     const int AH  = hp::CON_Y1 - hp::CON_Y0 - 8;
     int rows = (numBtns + 1) / 2;
+    if (rows < 1) rows = 1;
     bw = (AW - GAP) / 2;
     bh = (AH - (rows - 1) * GAP) / rows;
     bx = AX + (idx % 2) * (bw + GAP);
@@ -182,10 +195,25 @@ static const char* kNameKeys[] = {
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
     "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
     "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3",
-    "4", "5", "6", "7", "8", "9", "_", "-", ".", "[DEL]"
+    "4", "5", "6", "7", "8", "9", "_", "-", ".", "[DEL]",
+    "[OK]"
 };
-static constexpr int kNameCols = 10;
+static constexpr int kNameCols     = 10;
 static constexpr int kNameKeyCount = (int)(sizeof(kNameKeys) / sizeof(kNameKeys[0]));
+
+/* ── Fixed menus ── */
+static const char* kMainItems[]  = { "Learn", "Remotes", "Universal (all brands)" };
+static constexpr int kMainCount  = 3;
+
+static const char* kLearnItems[] = { "Send test", "Save...", "Learn again" };
+static constexpr int kLearnCount = 3;
+
+/* Identify (a paused sweep). Previous/Next step the cursor and send at once so
+ * the user can walk back to the code the device actually reacted to. */
+static const char* kIdentItems[] = {
+    "Resend this", "Previous", "Next", "Save as device...", "Resume sweep", "Stop"
+};
+static constexpr int kIdentCount = 6;
 
 /* Load a file from SD into PSRAM. Caller owns the returned buffer. */
 static uint8_t* _irLoadSdFile(const char* path, size_t& outLen)
@@ -194,23 +222,67 @@ static uint8_t* _irLoadSdFile(const char* path, size_t& outLen)
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return nullptr;
     size_t sz = f.size();
-    if (sz == 0) {
-        f.close();
-        return nullptr;
-    }
+    if (sz == 0) { f.close(); return nullptr; }
     uint8_t* buf = (uint8_t*)ps_malloc(sz);
-    if (!buf) {
-        f.close();
-        return nullptr;
-    }
+    if (!buf) { f.close(); return nullptr; }
     size_t got = f.read(buf, sz);
     f.close();
-    if (got != sz) {
-        free(buf);
-        return nullptr;
-    }
+    if (got != sz) { free(buf); return nullptr; }
     outLen = sz;
     return buf;
+}
+
+/* Raw captures are replayed at 38 kHz unless the decoder recognised a family
+ * that the library itself modulates differently (checked against the kXxxFreq
+ * constants in lib/IRremoteESP8266/src/ir_*.h: every AC family listed in the
+ * task is 38 kHz except the Panasonic and Daikin2 frames at 36.7 kHz). */
+static uint32_t carrierForDecode(decode_type_t t)
+{
+    switch (t) {
+        case PANASONIC:
+        case PANASONIC_AC:
+        case PANASONIC_AC32:
+        case DAIKIN2:
+            return 36700;
+        default:
+            return 38000;
+    }
+}
+
+/* Progress callback for the chunked universal-library scan. Keeps the button
+ * driver alive so a long-press B still aborts and exits during a 350 KB scan. */
+static bool _irIndexTick(void* ctx, uint32_t done, uint32_t total)
+{
+    (void)done; (void)total;
+    DEVICES* dev = static_cast<DEVICES*>(ctx);
+    dev->button.update();
+    dev->button.tick();
+    if (dev->button.B.isLongPress()) return false;
+    static uint32_t phase = 0;
+    hp::drawLoadingTick(dev->Lcd, phase += 4);
+    return true;
+}
+
+/* Input-box heading for the shared name editor. */
+static const char* _nameHeading(MOONCAKE::APPS::IrNameMode m)
+{
+    using M = MOONCAKE::APPS::IrNameMode;
+    return (m == M::NewDevice || m == M::RenameDevice || m == M::SaveAsDevice)
+           ? "Device:" : "Name:";
+}
+
+/* Draw the 3 fixed LearnResult rows below the summary line. */
+static void _drawLearnRows(LGFX_Class& lcd, int sel)
+{
+    for (int i = 0; i < kLearnCount; i++)
+        hp::drawListItem(lcd, i + 2, kLearnItems[i], i == sel);
+}
+
+/* Identify rows start one slot below the identified-signal summary. */
+static void _drawIdentRows(LGFX_Class& lcd, int sel)
+{
+    for (int i = 0; i < kIdentCount; i++)
+        hp::drawListItem(lcd, i + 1, kIdentItems[i], i == sel);
 }
 
 namespace MOONCAKE::APPS
@@ -230,35 +302,56 @@ namespace MOONCAKE::APPS
         _irSend->begin();
         _irRecv = nullptr;
 
-        /* Safe reset: do NOT memset structs containing std::vector members
-         * (memset over a vector orphans its heap allocation → leak on every
-         * reopen, which is what caused "second SD load fails"). */
-        _learnedSig.name[0]   = '\0';
-        _learnedSig.isRaw     = false;
-        _learnedSig.protocol  = UNKNOWN;
-        _learnedSig.value     = 0;
-        _learnedSig.bits      = 0;
-        _learnedSig.address   = 0;
-        _learnedSig.command   = 0;
-        _learnedSig.frequency = 38000;
-        _learnedSig.rawData.clear();
+        /* Never memset structs holding std::vector members. */
+        _learned.reset();
+        _learnSummary[0]   = '\0';
+        _learnFaded        = false;
+        _learnFadeMs       = 0;
+        _learnNormUs       = 0;
+        _learnDevice[0]    = '\0';
+        _learnReturnsToView = false;
 
-        _currentRemote.filename[0] = '\0';
-        _currentRemote.path[0]     = '\0';
-        _currentRemote.signals.clear();
+        _devStem[0] = '\0';
+        _devPath[0] = '\0';
+        _devSignals.clear();
+        _fileList.clear();
+        _univCloseFile();
+        _univPath[0]  = '\0';
+        _univIndex.clear();
+        _blastOffsets.clear();
+        _lastSent.reset();
+        _sweepGapMs   = kGapSlow;      /* the gap choice lives for one app session */
+        _blastIsTvbg  = false;
+        _blastResume  = false;
+        _blastCursor  = 0;
 
-        memset(_editBuf, 0, sizeof(_editBuf));
-        _editPos = 0;
-        _editCharIdx = 0;
-        _vkSel = 0;
+        _editBuf[0]     = '\0';
+        _vkSel          = 0;
+        _saveDevStem[0] = '\0';
+        _saveBtnName[0] = '\0';
+        _toastMsg[0]    = '\0';
+        _toastUntil     = 0;
+
         _learnIconTried = false;
-        _learnIconLen = 0;
-        _learnIconPng = nullptr;
+        _learnIconLen   = 0;
+        _learnIconPng   = nullptr;
 
-        /* Ensure IR directory exists on SD */
-        if (!SD_MMC.exists(IR_DIR)) {
-            SD_MMC.mkdir(IR_DIR);
-        }
+        /* Per-list selections and editor/confirm state must not survive a
+         * previous run of the app. */
+        _selRemoteList = _selSaveTarget = _selRemoteView = 0;
+        _selUnivMenu   = _selUnivCat    = 0;
+        _vkCol         = 0;
+        _nameMode      = IrNameMode::Button;
+        _nameFromDup   = false;
+        _selectStem[0] = '\0';
+        _confirmKind   = IrConfirmKind::None;
+        _confirmIndex  = 0;
+        _univCat       = -1;
+        _vbSel         = 0;
+        _rcToggle      = false;
+        _repaintOnly   = false;
+
+        if (!SD_MMC.exists(irstore::kIrDir)) SD_MMC.mkdir(irstore::kIrDir);
 
         _switchScene(IrScene::MainMenu);
     }
@@ -268,40 +361,55 @@ namespace MOONCAKE::APPS
         _device->button.update();
         _device->button.tick();
 
-        /* Long-press B = exit app */
+        /* Long-press B = exit app, from any screen. */
         if (_device->button.B.isLongPress()) {
             close();
             return;
         }
 
-        /* Scene enter (draw) + run (input) */
+        _serviceToast();
+
         if (_sceneDirty) {
             _sceneDirty = false;
             switch (_scene) {
                 case IrScene::MainMenu:      _enterMainMenu();      break;
                 case IrScene::LearnWait:     _enterLearnWait();     break;
                 case IrScene::LearnResult:   _enterLearnResult();   break;
-                case IrScene::LearnSaveName: _enterLearnSaveName(); break;
+                case IrScene::SaveTarget:    _enterSaveTarget();    break;
+                case IrScene::NameEditor:    _enterNameEditor();    break;
+                case IrScene::DupResolve:    _enterDupResolve();    break;
                 case IrScene::RemoteList:    _enterRemoteList();    break;
+                case IrScene::DeviceOptions: _enterDeviceOptions(); break;
                 case IrScene::RemoteView:    _enterRemoteView();    break;
+                case IrScene::SignalOptions: _enterSignalOptions(); break;
+                case IrScene::Confirm:       _enterConfirm();       break;
                 case IrScene::UniversalMenu: _enterUniversalMenu(); break;
-                case IrScene::UniversalTV:   _enterUniversalTV();   break;
-                case IrScene::TVBGone:       _enterTVBGone();       break;
-                case IrScene::Sending:       _enterSending();       break;
+                case IrScene::UniversalCat:  _enterUniversalCat();  break;
+                case IrScene::Blast:         _enterBlast();         break;
+                case IrScene::Identify:      _enterIdentify();      break;
             }
+            /* A live toast survives a scene repaint. */
+            if (_toastUntil && millis() < _toastUntil)
+                hp::drawToast(_device->Lcd, _toastMsg);
+            _repaintOnly = false;
         }
 
         switch (_scene) {
             case IrScene::MainMenu:      _runMainMenu();      break;
             case IrScene::LearnWait:     _runLearnWait();     break;
             case IrScene::LearnResult:   _runLearnResult();   break;
-            case IrScene::LearnSaveName: _runLearnSaveName(); break;
+            case IrScene::SaveTarget:    _runSaveTarget();    break;
+            case IrScene::NameEditor:    _runNameEditor();    break;
+            case IrScene::DupResolve:    _runDupResolve();    break;
             case IrScene::RemoteList:    _runRemoteList();    break;
+            case IrScene::DeviceOptions: _runDeviceOptions(); break;
             case IrScene::RemoteView:    _runRemoteView();    break;
+            case IrScene::SignalOptions: _runSignalOptions(); break;
+            case IrScene::Confirm:       _runConfirm();       break;
             case IrScene::UniversalMenu: _runUniversalMenu(); break;
-            case IrScene::UniversalTV:   _runUniversalTV();   break;
-            case IrScene::TVBGone:       _runTVBGone();       break;
-            case IrScene::Sending:       _runSending();       break;
+            case IrScene::UniversalCat:  _runUniversalCat();  break;
+            case IrScene::Blast:         _runBlast();         break;
+            case IrScene::Identify:      _runIdentify();      break;
         }
     }
 
@@ -309,1087 +417,1586 @@ namespace MOONCAKE::APPS
     {
         _stopRx();
         if (_irSend) { delete _irSend; _irSend = nullptr; }
-        if (_irRecv) { delete _irRecv; _irRecv = nullptr; }
+        _device->led.off();
         _fileList.clear();
-        _currentRemote.signals.clear();
-        _univActions.clear();
-        _univBlastQ.clear();
-        if (_learnIconPng) {
-            free(_learnIconPng);
-            _learnIconPng = nullptr;
-        }
-        _learnIconLen = 0;
+        _devSignals.clear();
+        _univCloseFile();
+        _univIndex.clear();
+        _blastOffsets.clear();
+        _rows.clear();
+        _subs.clear();
+        if (_learnIconPng) { free(_learnIconPng); _learnIconPng = nullptr; }
+        _learnIconLen   = 0;
         _learnIconTried = false;
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Scene management
+     *  Scene / list plumbing
      * ════════════════════════════════════════════════════════════ */
 
-    void App09::_switchScene(IrScene s)
+    void App09::_switchScene(IrScene s, bool resetSel)
     {
-        _prevScene = _scene;
-        _scene = s;
+        _prevScene  = _scene;
+        _scene      = s;
         _sceneDirty = true;
-        _menuSel = 0;
-        _scrollOffset = 0;
+        if (resetSel) { _sel = 0; _scrollTop = 0; }
     }
 
-    /* ════════════════════════════════════════════════════════════
-     *  TUI drawing helpers
-     * ════════════════════════════════════════════════════════════ */
+    int App09::_visibleRows() const
+    {
+        return _subs.empty() ? hp::LIST_VIS : hp::LIST2_VIS;
+    }
 
-    void App09::_drawHeader(const char* title)
+    void App09::_drawRows()
+    {
+        auto& Lcd  = _device->Lcd;
+        const int total = (int)_rows.size();
+        const int vis   = _visibleRows();
+        const bool two  = !_subs.empty();
+
+        if (_sel >= total)  _sel = (total > 0) ? total - 1 : 0;
+        if (_sel < 0)       _sel = 0;
+        if (_sel < _scrollTop)          _scrollTop = _sel;
+        if (_sel >= _scrollTop + vis)   _scrollTop = _sel - vis + 1;
+        if (_scrollTop < 0)             _scrollTop = 0;
+
+        for (int r = 0; r < vis; r++) {
+            int idx = _scrollTop + r;
+            if (idx < total) {
+                if (two) {
+                    const char* sub = (idx < (int)_subs.size()) ? _subs[idx].c_str() : "";
+                    hp::drawListItemSub(Lcd, r, _rows[idx].c_str(), sub, idx == _sel);
+                } else {
+                    hp::drawListItem(Lcd, r, _rows[idx].c_str(), idx == _sel);
+                }
+            } else {
+                if (two) hp::clearListRow2(Lcd, r);
+                else     hp::clearListRow(Lcd, r);
+            }
+        }
+        if (two) hp::drawScrollbar2(Lcd, total, _scrollTop, vis);
+        else     hp::drawScrollbar(Lcd, total, _scrollTop, vis);
+    }
+
+    bool App09::_navList()
+    {
+        const int total = (int)_rows.size();
+        if (total <= 0) return false;
+        const int old = _sel;
+        if (_device->button.Up.pressed()   && _sel > 0)         _sel--;
+        if (_device->button.Down.pressed() && _sel < total - 1) _sel++;
+        return _sel != old;
+    }
+
+    void App09::_drawCentered(const char* l1, const char* l2, const char* l3,
+                              const char* l4, uint16_t color)
     {
         auto& Lcd = _device->Lcd;
-        hp::drawChrome(Lcd);
-        hp::drawHeader(Lcd, title);
+        hp::clearContent(Lcd);
+
+        const char* lines[4] = { l1, l2, l3, l4 };
+        int n = 0;
+        for (int i = 0; i < 4; i++) if (lines[i] && lines[i][0]) n++;
+        if (n == 0) return;
+
+        const int lh = 20;
+        int y = hp::CON_Y0 + (hp::CON_H - n * lh) / 2;
+        Lcd.setFont(&fonts::efontCN_16);
+        Lcd.setTextColor(color, hp::COL_BG);
+        for (int i = 0; i < 4; i++) {
+            if (!lines[i] || !lines[i][0]) continue;
+            int tw = (int)strlen(lines[i]) * 8;
+            Lcd.setCursor((hp::W - tw) / 2, y);
+            Lcd.print(lines[i]);
+            y += lh;
+        }
     }
 
-    void App09::_drawMenuItem(int y, int index, const char* text, bool selected)
+    void App09::_toast(const char* fmt, ...)
     {
-        (void)index;
-        int row = (y - MENU_Y0) / ITEM_H;
-        if (row < 0) row = 0;
-        if (row >= hp::LIST_VIS) row = hp::LIST_VIS - 1;
-        hp::drawListItem(_device->Lcd, row, text, selected);
-        hp::drawScrollbar(_device->Lcd, _menuCount, _scrollOffset, MENU_VISIBLE);
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(_toastMsg, sizeof(_toastMsg), fmt, ap);
+        va_end(ap);
+        _toastUntil = millis() + 600;
+        /* With a repaint already queued the banner is drawn after the new
+         * scene, never for one frame on top of the old one. */
+        if (!_sceneDirty) hp::drawToast(_device->Lcd, _toastMsg);
     }
 
-    /* Two-line list item (BLE Spam / Bad USB style): title + dimmed subtitle. */
-    void App09::_drawMenuItem2(int y, int index, const char* title,
-                               const char* sub, bool selected)
+    void App09::_serviceToast()
     {
-        (void)index;
-        int row = (y - MENU_Y0) / ITEM2_H;
-        if (row < 0) row = 0;
-        if (row >= hp::LIST2_VIS) row = hp::LIST2_VIS - 1;
-        hp::drawListItemSub(_device->Lcd, row, title, sub, selected);
-        hp::drawScrollbar2(_device->Lcd, _menuCount, _scrollOffset, MENU2_VISIBLE);
-    }
-
-    void App09::_drawFooter(const char* left, const char* right)
-    {
-        hp::drawFooter(_device->Lcd, left, right);
-    }
-
-    void App09::_drawFooter3(const char* dirHint, const char* aHint, const char* bHint)
-    {
-        hp::drawFooter3(_device->Lcd, dirHint, aHint, bHint);
-    }
-
-    void App09::_drawMsgBox(const char* line1, const char* line2)
-    {
-        hp::drawDialog(_device->Lcd, line1, line2);
+        if (_toastUntil && millis() >= _toastUntil) {
+            _toastUntil  = 0;
+            _repaintOnly = true;     /* repaint wipes the banner, nothing else */
+            _sceneDirty  = true;
+        }
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Main Menu
+     *  Main menu
      * ════════════════════════════════════════════════════════════ */
-
-    static const char* kMainItems[] = {
-        "Universal Remote",
-        "Learn New Signal",
-        "Saved Remotes",
-    };
-    static constexpr int kMainCount = 3;
 
     void App09::_enterMainMenu()
     {
-        _menuCount = kMainCount;
-        _drawHeader("Infrared");
-        _drawFooter3("[^v]Select", "[A]Enter", "[B]Exit");
-        for (int i = 0; i < kMainCount; i++) {
-            _drawMenuItem(MENU_Y0 + i * ITEM_H, i, kMainItems[i], i == _menuSel);
-            if (i != _menuSel) {
-                int sepY = hp::CON_Y0 + 2 + i * hp::ITEM_H + hp::ITEM_H - 1;
-                _device->Lcd.drawFastHLine(1, sepY, hp::W - 3 - hp::SBAR_W, hp::COL_BG);
-            }
-        }
+        auto& Lcd = _device->Lcd;
+        _rows.clear();
+        _subs.clear();
+        for (int i = 0; i < kMainCount; i++) _rows.push_back(kMainItems[i]);
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Infrared");
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Exit");
+        _drawRows();
     }
 
     void App09::_runMainMenu()
     {
-        bool redraw = false;
-        if (_device->button.Up.pressed()   && _menuSel > 0)              { _menuSel--; redraw = true; }
-        if (_device->button.Down.pressed() && _menuSel < kMainCount - 1) { _menuSel++; redraw = true; }
-
-        if (redraw) {
-            for (int i = 0; i < kMainCount; i++) {
-                _drawMenuItem(MENU_Y0 + i * ITEM_H, i, kMainItems[i], i == _menuSel);
-                if (i != _menuSel) {
-                    int sepY = hp::CON_Y0 + 2 + i * hp::ITEM_H + hp::ITEM_H - 1;
-                    _device->Lcd.drawFastHLine(1, sepY, hp::W - 3 - hp::SBAR_W, hp::COL_BG);
-                }
-            }
-        }
+        if (_navList()) _drawRows();
 
         if (_device->button.A.pressed()) {
-            switch (_menuSel) {
-                case 0: _switchScene(IrScene::UniversalMenu); break;
-                case 1: _switchScene(IrScene::LearnWait);     break;
-                case 2: _switchScene(IrScene::RemoteList);    break;
+            switch (_sel) {
+                case 0: _startLearn(nullptr); break;
+                case 1: _selRemoteList = 0; _switchScene(IrScene::RemoteList);    break;
+                case 2: _selUnivMenu   = 0; _switchScene(IrScene::UniversalMenu); break;
             }
+            return;
         }
-        if (_device->button.B.pressed()) {
-            close();
-        }
+        if (_device->button.B.pressed()) close();
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Learn — Wait for signal
+     *  Learn
      * ════════════════════════════════════════════════════════════ */
+
+    void App09::_startLearn(const char* deviceStem)
+    {
+        if (deviceStem && deviceStem[0]) {
+            strncpy(_learnDevice, deviceStem, sizeof(_learnDevice) - 1);
+            _learnDevice[sizeof(_learnDevice) - 1] = '\0';
+            _learnReturnsToView = true;
+        } else {
+            _learnDevice[0] = '\0';
+            _learnReturnsToView = false;
+        }
+        _switchScene(IrScene::LearnWait);
+    }
 
     void App09::_enterLearnWait()
     {
+        auto& Lcd = _device->Lcd;
         if (!_learnIconTried) {
             _learnIconTried = true;
-            _learnIconPng = _irLoadSdFile(IR_LEARN_ICON_PATH, _learnIconLen);
+            _learnIconPng   = _irLoadSdFile(IR_LEARN_ICON_PATH, _learnIconLen);
         }
 
-        _drawHeader("Learn Signal");
-        hp::drawHeader(_device->Lcd, "Learn Signal", "RX", hp::COL_WARN);
-        _drawFooter3(nullptr, nullptr, "[B]Back");
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Learn", "RX", hp::COL_WARN);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, nullptr, nullptr, nullptr, "[B]Back");
 
-        auto& Lcd = _device->Lcd;
-        Lcd.setTextColor(COL_FG, COL_BG);
-        Lcd.setCursor(20, 30);
-        Lcd.print("Point remote at IR port");
-        Lcd.setCursor(20, 50);
-        Lcd.print("and press any button...");
+        Lcd.setFont(&fonts::efontCN_16);
+        Lcd.setTextColor(hp::COL_FG, hp::COL_BG);
+        Lcd.setCursor(16, hp::CON_Y0 + 8);
+        Lcd.print("Point the remote at MeowKit");
+        Lcd.setCursor(16, hp::CON_Y0 + 26);
+        Lcd.print("and press a button");
 
-        if (_learnIconPng && _learnIconLen > 0) {
-            hp::drawPng(Lcd, 78, 74, _learnIconPng, _learnIconLen);
-        }
+        if (_learnIconPng && _learnIconLen > 0)
+            hp::drawPng(Lcd, 78, hp::CON_Y0 + 52, _learnIconPng, _learnIconLen);
 
-        Lcd.setCursor(20, 150);
-        Lcd.setTextColor(COL_FG_DIM, COL_BG);
-        Lcd.print("Waiting for IR signal...");
+        Lcd.setTextColor(hp::COL_DIM, hp::COL_BG);
+        Lcd.setCursor(16, hp::CON_Y1 - 22);
+        if (_learnDevice[0]) Lcd.printf("Saving into: %s", _learnDevice);
+        else                 Lcd.print("Waiting for IR signal...");
 
-        _startRx();
+        /* A repaint (expiring toast) must not abort a capture in progress. */
+        if (!_repaintOnly) _startRx();
     }
 
     void App09::_runLearnWait()
     {
         if (_device->button.B.pressed()) {
             _stopRx();
-            _switchScene(IrScene::MainMenu);
+            if (_learnReturnsToView && _learnDevice[0]) _openDevice(_learnDevice);
+            else                                       _switchScene(IrScene::MainMenu);
             return;
         }
 
         if (!_irRecv) return;
 
         decode_results results;
-        if (_irRecv->decode(&results)) {
-            /* Store the received signal (do NOT memset over the vector) */
-            _learnedSig.rawData.clear();
-            _learnedSig.name[0]   = '\0';
-            _learnedSig.isRaw     = false;
-            _learnedSig.protocol  = UNKNOWN;
-            _learnedSig.value     = 0;
-            _learnedSig.bits      = 0;
-            _learnedSig.address   = 0;
-            _learnedSig.command   = 0;
-            _learnedSig.frequency = 38000;
-            strncpy(_learnedSig.name, "Signal", sizeof(_learnedSig.name) - 1);
+        if (!_irRecv->decode(&results)) return;
 
-            if (results.decode_type != UNKNOWN && results.decode_type != (decode_type_t)(-1)) {
-                _learnedSig.isRaw    = false;
-                _learnedSig.protocol = results.decode_type;
-                _learnedSig.value    = results.value;
-                _learnedSig.bits     = results.bits;
-                _learnedSig.address  = results.address;
-                _learnedSig.command  = results.command;
-            } else {
-                _learnedSig.isRaw     = true;
-                _learnedSig.frequency = 38000;
-                _learnedSig.rawData.clear();
-                for (uint16_t i = 1; i < results.rawlen; i++) {
-                    _learnedSig.rawData.push_back(results.rawbuf[i] * kRawTick);
-                }
+        /* IRrecv was built with save_buffer = true, so decode() copies the
+         * capture and rearms the receiver itself; no resume() call is needed. */
+
+        /* Build the timing list first: the fade measurement describes the
+         * capture itself and is worth logging even for a frame we discard. */
+        std::vector<uint16_t> raw;
+        raw.reserve(results.rawlen);
+        for (uint16_t i = 1; i < results.rawlen; i++) {
+            uint32_t us = (uint32_t)results.rawbuf[i] * kRawTick;
+            raw.push_back(us > 65535 ? 65535 : (uint16_t)us);
+        }
+        const irraw::FadeInfo fade = irraw::analyseFade(raw.data(), raw.size());
+
+        Serial.printf("IR_LEARN,decode_type=%s,bits=%u,rawlen=%u,overflow=%d,"
+                      "fade=%.2f,fade_ms=%lu\n",
+                      typeToString(results.decode_type, false).c_str(),
+                      (unsigned)results.bits, (unsigned)results.rawlen,
+                      results.overflow ? 1 : 0,
+                      (double)fade.ratio, (unsigned long)(fade.fadeUs / 1000));
+
+        /* A truncated capture can never be replayed; do not keep it. */
+        if (results.overflow) {
+            _toast("Capture overflow - press again");
+            return;
+        }
+
+        /* A repeat / ditto frame carries no payload. Storing it would produce
+         * a garbage RAW blob, so drop it and keep listening. */
+        if (results.repeat || results.bits == 0) {
+            _toast("Repeat frame ignored - press again");
+            return;
+        }
+
+        _learned.reset();
+        _learnFaded  = false;
+        _learnFadeMs = 0;
+        _learnNormUs = 0;
+
+        /* decode_results → irfc::TxKind (spec §3). Anything not listed is raw. */
+        irfc::TxKind kind = irfc::TxKind::None;
+        switch (results.decode_type) {
+            case NEC:       kind = irfc::TxKind::NEC;          break;
+            case SAMSUNG:   kind = irfc::TxKind::SAMSUNG;      break;
+            case SONY:      kind = irfc::TxKind::SONY;         break;
+            case RC5:       kind = irfc::TxKind::RC5;          break;
+            case RC6:       kind = irfc::TxKind::RC6;          break;
+            case PANASONIC: kind = irfc::TxKind::PANASONIC64;  break;
+            case PIONEER:   kind = irfc::TxKind::PIONEER;      break;
+            case SANYO_LC7461: kind = irfc::TxKind::SANYO_LC7461; break;
+            default:        kind = irfc::TxKind::None;         break;
+        }
+
+        bool parsed = false;
+        if (kind != irfc::TxKind::None) {
+            irfc::Flipper fl;
+            irfc::TxFrame tf;
+            /* Learn-side self-check: only store parsed when the round trip
+             * reproduces exactly what the receiver reported. */
+            /* The toggle bit of RC5 (bit 11) / RC6 (bit 16) is not part of the
+             * stored signal, so it is masked out of the comparison. */
+            uint64_t toggleMask = 0;
+            if (kind == irfc::TxKind::RC5) toggleMask = 1ULL << 11;
+            if (kind == irfc::TxKind::RC6) toggleMask = 1ULL << 16;
+            if (irfc::fromDecode(kind, results.value, results.bits, fl) &&
+                irfc::toTx(fl, tf) &&
+                (tf.data & ~toggleMask) == (results.value & ~toggleMask) &&
+                tf.nbits == results.bits) {
+                _learned.isRaw   = false;
+                _learned.proto   = fl.proto;
+                _learned.address = fl.address;
+                _learned.command = fl.command;
+                parsed = true;
+                snprintf(_learnSummary, sizeof(_learnSummary), "%s · A:%02X C:%02X",
+                         irfc::protoName(fl.proto),
+                         (unsigned)fl.address, (unsigned)fl.command);
+            }
+        }
+
+        if (!parsed) {
+            /* Anything shorter than a real frame is noise or a stray edge. */
+            static constexpr int kMinRawSamples = 8;
+            if ((int)raw.size() < kMinRawSamples) {
+                _toast("Signal too short - press again");
+                return;
             }
 
-            _stopRx();
-            _switchScene(IrScene::LearnResult);
+            _learnFaded  = fade.faded;
+            _learnFadeMs = fade.fadeUs / 1000;
+
+            /* An unrecognised pulse-distance frame whose marks decayed is
+             * rebuilt: every mark back to the clean leading value, the
+             * difference given to its space so the bit periods survive. */
+            uint16_t markUs = 0;
+            if (results.decode_type == UNKNOWN &&
+                irraw::canNormalise(raw.data(), raw.size(), markUs)) {
+                irraw::normaliseMarks(raw.data(), raw.size(), markUs);
+                _learnNormUs = markUs;
+            }
+
+            _learned.isRaw     = true;
+            _learned.frequency = carrierForDecode(results.decode_type);
+            _learned.raw.swap(raw);
+            if (_learnNormUs) {
+                snprintf(_learned.note, sizeof(_learned.note),
+                         "meowkit: marks normalised to %u us (fade %.2f)",
+                         (unsigned)_learnNormUs, (double)fade.ratio);
+            }
+            _buildRawSummary(results.decode_type, results.bits);
+
+            if (_learnFaded)
+                _toast("Faded at %lu ms - move 20-50 cm",
+                       (unsigned long)_learnFadeMs);
         }
+
+        _stopRx();
+        _switchScene(IrScene::LearnResult);
     }
 
-    /* ════════════════════════════════════════════════════════════
-     *  Learn — Result display
-     * ════════════════════════════════════════════════════════════ */
+    /* "RAW · 407 · FADED norm" / "RAW (HITACHI_AC 280b) · 583".
+     * The protocol block and "norm" are mutually exclusive (normalisation only
+     * runs on UNKNOWN), but the length is still checked before it is used. */
+    void App09::_buildRawSummary(decode_type_t type, uint16_t bits)
+    {
+        const int n = (int)_learned.raw.size();
+
+        char flags[16] = {0};
+        if (_learnFaded && _learnNormUs) snprintf(flags, sizeof(flags), " · FADED norm");
+        else if (_learnFaded)            snprintf(flags, sizeof(flags), " · FADED");
+        else if (_learnNormUs)           snprintf(flags, sizeof(flags), " · norm");
+
+        char body[64];
+        if (type != UNKNOWN) {
+            /* bits == 0 was rejected earlier, so the count is always known. */
+            String proto = typeToString(type, false);
+            snprintf(body, sizeof(body), "RAW (%s %ub) · %d", proto.c_str(),
+                     (unsigned)bits, n);
+        } else if (flags[0]) {
+            snprintf(body, sizeof(body), "RAW · %d", n);
+        } else {
+            snprintf(body, sizeof(body), "RAW · %d samples", n);
+        }
+
+        if (strlen(body) + strlen(flags) < sizeof(_learnSummary))
+            snprintf(_learnSummary, sizeof(_learnSummary), "%s%s", body, flags);
+        else    /* a very long protocol name: drop the detail, keep the flags */
+            snprintf(_learnSummary, sizeof(_learnSummary), "RAW · %d%s", n, flags);
+    }
 
     void App09::_enterLearnResult()
     {
-        _drawHeader("Signal Received");
-        hp::drawHeader(_device->Lcd, "Signal Received", "OK", hp::COL_FG);
-        _drawFooter3("[O]Retry", "[A]Send", "[B]Save");
-
         auto& Lcd = _device->Lcd;
-        int y = MENU_Y0;
+        _rows.clear();
+        _subs.clear();
+        for (int i = 0; i < kLearnCount; i++) _rows.push_back(kLearnItems[i]);
 
-        if (_learnedSig.isRaw) {
-            Lcd.setTextColor(COL_ACCENT, COL_BG);
-            Lcd.setCursor(20, y);
-            Lcd.print("Type: RAW");
-            y += 22;
-            Lcd.setTextColor(COL_FG, COL_BG);
-            Lcd.setCursor(20, y);
-            Lcd.printf("Samples: %d", (int)_learnedSig.rawData.size());
-            y += 22;
-            Lcd.setCursor(20, y);
-            Lcd.printf("Frequency: %luHz", _learnedSig.frequency);
-        } else {
-            String proto = typeToString(_learnedSig.protocol, false);
-            Lcd.setTextColor(COL_ACCENT, COL_BG);
-            Lcd.setCursor(20, y);
-            Lcd.printf("Protocol: %s", proto.c_str());
-            y += 22;
-            Lcd.setTextColor(COL_FG, COL_BG);
-            Lcd.setCursor(20, y);
-            Lcd.printf("Value: 0x%llX", _learnedSig.value);
-            y += 22;
-            Lcd.setCursor(20, y);
-            Lcd.printf("Bits: %d", _learnedSig.bits);
-            y += 22;
-            Lcd.setCursor(20, y);
-            Lcd.printf("Addr: 0x%X  Cmd: 0x%X",
-                        _learnedSig.address, _learnedSig.command);
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Signal", "OK", hp::COL_FG);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Back");
+
+        Lcd.setFont(&fonts::efontCN_16);
+        Lcd.setTextColor(hp::COL_ACCENT, hp::COL_BG);
+        Lcd.setCursor(hp::PAD_X + 8, MENU_Y0 + 6);
+        Lcd.print(_learnSummary);
+
+        /* One extra line explaining what the post-processing did. */
+        if (_learnFaded || _learnNormUs) {
+            char info[48];
+            if (_learnFaded)
+                snprintf(info, sizeof(info), "Signal faded at %lu ms",
+                         (unsigned long)_learnFadeMs);
+            else
+                snprintf(info, sizeof(info), "Marks normalised to %u us",
+                         (unsigned)_learnNormUs);
+            Lcd.setTextColor(_learnFaded ? hp::COL_WARN : hp::COL_DIM, hp::COL_BG);
+            Lcd.setCursor(hp::PAD_X + 8, MENU_Y0 + 6 + hp::ITEM_H);
+            Lcd.print(info);
         }
+
+        _drawLearnRows(Lcd, _sel);
     }
 
     void App09::_runLearnResult()
     {
-        /* [O] = joystick: any direction triggers Retry */
-        if (_device->button.Up.pressed()    ||
-            _device->button.Down.pressed()  ||
-            _device->button.Left.pressed()  ||
-            _device->button.Right.pressed()) {
-            _switchScene(IrScene::LearnWait);
+        if (_navList()) _drawLearnRows(_device->Lcd, _sel);
+
+        if (_device->button.A.pressed()) {
+            switch (_sel) {
+                case 0:                       /* Send test — through the codec */
+                    _sendOrToast(_learned, "Sent test");
+                    break;
+                case 1:                       /* Save... */
+                    if (_learnDevice[0]) {
+                        strncpy(_saveDevStem, _learnDevice, sizeof(_saveDevStem) - 1);
+                        _saveDevStem[sizeof(_saveDevStem) - 1] = '\0';
+                        char path[168];
+                        irstore::devicePath(_saveDevStem, path, sizeof(path));
+                        int n = irstore::countSignals(path);
+                        snprintf(_editBuf, sizeof(_editBuf), "BTN_%d", (n > 0 ? n : 0) + 1);
+                        _nameMode    = IrNameMode::Button;
+                        _vkSel       = 0;
+                        _nameFromDup = false;
+                        _switchScene(IrScene::NameEditor);
+                    } else {
+                        _switchScene(IrScene::SaveTarget);
+                    }
+                    break;
+                case 2:                       /* Learn again */
+                    _switchScene(IrScene::LearnWait);
+                    break;
+            }
             return;
         }
-        if (_device->button.A.pressed()) {
-            _txSignal(_learnedSig);
-            hp::drawToast(_device->Lcd, "SENT", hp::COL_FG);
-            delay(300);
-            _sceneDirty = true;
-        }
+
         if (_device->button.B.pressed()) {
-            _switchScene(IrScene::LearnSaveName);
+            if (_learnReturnsToView && _learnDevice[0]) _openDevice(_learnDevice);
+            else                                       _switchScene(IrScene::MainMenu);
         }
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Learn — Save name editor
+     *  Save target picker
      * ════════════════════════════════════════════════════════════ */
 
-    void App09::_drawNameEditor()
+    void App09::_enterSaveTarget()
     {
-        hp::drawVirtualKeyboard(
-            _device->Lcd,
-            "Name:",
-            _editBuf,
-            (int)sizeof(_editBuf) - 1,
-            kNameKeys,
-            kNameKeyCount,
-            kNameCols,
-            _vkSel
-        );
+        auto& Lcd = _device->Lcd;
+        /* A bare repaint redraws the cached rows; only a real entry rescans. */
+        if (!_repaintOnly) {
+            _fileList.clear();
+            irstore::listIrFiles(irstore::kIrDir, _fileList);
+
+            _rows.clear();
+            _subs.clear();
+            _rows.push_back("+ New device...");
+            _subs.push_back("create a new .ir file");
+            for (const auto& f : _fileList) {
+                char path[168];
+                snprintf(path, sizeof(path), "%s/%s", irstore::kIrDir, f.c_str());
+                int n = irstore::countSignals(path);
+                char sub[24];
+                snprintf(sub, sizeof(sub), "%d buttons", n < 0 ? 0 : n);
+                _rows.push_back(stemOf(f));
+                _subs.push_back(sub);
+            }
+        }
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Save to", nullptr);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Back");
+        _sel = _selSaveTarget;
+        _drawRows();
     }
 
-    void App09::_enterLearnSaveName()
+    void App09::_runSaveTarget()
     {
-        strncpy(_editBuf, _learnedSig.name, sizeof(_editBuf) - 1);
-        _editBuf[sizeof(_editBuf) - 1] = '\0';
-        _editPos = strlen(_editBuf);
-        _editCharIdx = 0;
-        _vkSel = 0;
+        if (_navList()) { _selSaveTarget = _sel; _drawRows(); }
 
-        _drawHeader("SAVE SIGNAL");
-        _drawFooter3("[^v<>]Move", "[A]Select", "[B]Save");
-
-        _drawNameEditor();
+        if (_device->button.A.pressed()) {
+            _selSaveTarget = _sel;
+            if (_sel == 0) {
+                _editBuf[0]  = '\0';
+                _vkSel       = 0;
+                _nameMode    = IrNameMode::NewDevice;
+                _nameFromDup = false;
+                _switchScene(IrScene::NameEditor);
+            } else {
+                String stem = _rows[_sel];
+                strncpy(_saveDevStem, stem.c_str(), sizeof(_saveDevStem) - 1);
+                _saveDevStem[sizeof(_saveDevStem) - 1] = '\0';
+                char path[168];
+                irstore::devicePath(_saveDevStem, path, sizeof(path));
+                int n = irstore::countSignals(path);
+                snprintf(_editBuf, sizeof(_editBuf), "BTN_%d", (n > 0 ? n : 0) + 1);
+                _vkSel       = 0;
+                _nameMode    = IrNameMode::Button;
+                _nameFromDup = false;
+                _switchScene(IrScene::NameEditor);
+            }
+            return;
+        }
+        if (_device->button.B.pressed()) _switchScene(IrScene::LearnResult);
     }
 
-    void App09::_runLearnSaveName()
+    /* ════════════════════════════════════════════════════════════
+     *  Name editor (shared virtual keyboard)
+     * ════════════════════════════════════════════════════════════ */
+
+    void App09::_enterNameEditor()
+    {
+        auto& Lcd = _device->Lcd;
+        const char* title = "Button name";
+        switch (_nameMode) {
+            case IrNameMode::NewDevice:    title = "Device name";   break;
+            case IrNameMode::RenameDevice: title = "Rename device"; break;
+            case IrNameMode::RenameSignal: title = "Rename button"; break;
+            case IrNameMode::SaveAsDevice: title = "Save as device"; break;
+            default: break;
+        }
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, title, nullptr);
+        hp::drawFooter4(Lcd, "[^v<>]Move", "[A]Key", nullptr, "[B]Cancel");
+        hp::drawVirtualKeyboard(Lcd, _nameHeading(_nameMode), _editBuf, (int)sizeof(_editBuf) - 1,
+                                kNameKeys, kNameKeyCount, kNameCols, _vkSel);
+    }
+
+    void App09::_runNameEditor()
     {
         bool redraw = false;
+
+        /* The last row is partial (only [OK]); it is reachable from every key
+         * of the row above, and Up returns to the column the user came from. */
+        const int lastRowStart = ((kNameKeyCount - 1) / kNameCols) * kNameCols;
+        const bool onLastRow   = (_vkSel >= lastRowStart);
+
         if (_device->button.Up.pressed() && _vkSel >= kNameCols) {
-            _vkSel -= kNameCols;
+            _vkSel = onLastRow ? (lastRowStart - kNameCols + _vkCol) : (_vkSel - kNameCols);
             redraw = true;
         }
-        if (_device->button.Down.pressed() && _vkSel + kNameCols < kNameKeyCount) {
-            _vkSel += kNameCols;
-            redraw = true;
+        if (_device->button.Down.pressed() && !onLastRow) {
+            _vkCol = _vkSel % kNameCols;
+            int down = _vkSel + kNameCols;
+            _vkSel  = (down < kNameKeyCount) ? down : lastRowStart;
+            redraw  = true;
         }
-        if (_device->button.Left.pressed() && (_vkSel % kNameCols) > 0) {
-            _vkSel--;
-            redraw = true;
+        if (_device->button.Left.pressed()) {
+            if (onLastRow)                 { _vkSel = kNameKeyCount - 2; redraw = true; }
+            else if (_vkSel % kNameCols)   { _vkSel--;                   redraw = true; }
         }
-        if (_device->button.Right.pressed() && (_vkSel % kNameCols) < (kNameCols - 1) && _vkSel + 1 < kNameKeyCount) {
-            _vkSel++;
-            redraw = true;
+        if (_device->button.Right.pressed()) {
+            if (onLastRow)                                            { _vkSel = 0;  redraw = true; }
+            else if ((_vkSel % kNameCols) < kNameCols - 1
+                     && _vkSel + 1 < kNameKeyCount)                   { _vkSel++;    redraw = true; }
         }
 
         if (_device->button.A.pressed()) {
             const char* key = kNameKeys[_vkSel];
-            int nameLen = strlen(_editBuf);
+            int len = (int)strlen(_editBuf);
+            if (strcmp(key, "[OK]") == 0) {
+                _finishNameEditor();
+                return;
+            }
             if (strcmp(key, "[DEL]") == 0) {
-                if (nameLen > 0) {
-                    _editBuf[nameLen - 1] = '\0';
-                    redraw = true;
-                }
-            } else if (nameLen < (int)sizeof(_editBuf) - 1) {
-                _editBuf[nameLen] = key[0];
-                _editBuf[nameLen + 1] = '\0';
+                if (len > 0) { _editBuf[len - 1] = '\0'; redraw = true; }
+            } else if (len < (int)sizeof(_editBuf) - 1) {
+                _editBuf[len]     = key[0];
+                _editBuf[len + 1] = '\0';
                 redraw = true;
             }
         }
 
-        if (redraw) _drawNameEditor();
+        if (redraw)
+            hp::drawVirtualKeyboard(_device->Lcd, _nameHeading(_nameMode), _editBuf,
+                                    (int)sizeof(_editBuf) - 1, kNameKeys,
+                                    kNameKeyCount, kNameCols, _vkSel);
 
-        if (_device->button.B.pressed()) {
-            int nameLen = strlen(_editBuf);
-            while (nameLen > 0 && (_editBuf[nameLen-1] == ' ' || _editBuf[nameLen-1] == '_')) {
-                _editBuf[--nameLen] = '\0';
+        if (_device->button.B.pressed()) _cancelNameEditor();
+    }
+
+    void App09::_drainInput()
+    {
+        _device->button.update();
+        /* tick() advances the long-press detector; it only clears the flag once
+         * the button has been released (see _waitButtonsReleased). */
+        _device->button.tick();
+        (void)_device->button.A.pressed();     (void)_device->button.A.released();
+        (void)_device->button.B.pressed();     (void)_device->button.B.released();
+        (void)_device->button.Up.pressed();    (void)_device->button.Up.released();
+        (void)_device->button.Down.pressed();  (void)_device->button.Down.released();
+        (void)_device->button.Left.pressed();  (void)_device->button.Left.released();
+        (void)_device->button.Right.pressed(); (void)_device->button.Right.released();
+    }
+
+    /* Button_Class clears its long-press flag in tick(), but only after the
+     * button goes back up. A scan aborted with a long press therefore has to
+     * wait for the release before the app's global exit check runs again. */
+    void App09::_waitButtonsReleased()
+    {
+        const uint32_t deadline = millis() + 3000;   /* never hang on a stuck pin */
+        for (;;) {
+            _device->button.update();
+            _device->button.tick();
+            const bool up =
+                _device->button.A.state()    == Button_Class::RELEASED &&
+                _device->button.B.state()    == Button_Class::RELEASED &&
+                _device->button.Up.state()   == Button_Class::RELEASED &&
+                _device->button.Down.state() == Button_Class::RELEASED &&
+                _device->button.Left.state() == Button_Class::RELEASED &&
+                _device->button.Right.state()== Button_Class::RELEASED;
+            if (up || (int32_t)(millis() - deadline) >= 0) break;
+        }
+        _drainInput();
+    }
+
+    /* B leaves the editor without writing anything. */
+    void App09::_cancelNameEditor()
+    {
+        switch (_nameMode) {
+            case IrNameMode::NewDevice:
+                _switchScene(IrScene::SaveTarget, false);
+                break;
+            case IrNameMode::Button:
+                if (_nameFromDup) _switchScene(IrScene::DupResolve, false);
+                else _switchScene(_learnDevice[0] ? IrScene::LearnResult
+                                                  : IrScene::SaveTarget, false);
+                break;
+            case IrNameMode::RenameDevice:
+                _switchScene(IrScene::DeviceOptions, false);
+                break;
+            case IrNameMode::RenameSignal:
+                _switchScene(IrScene::SignalOptions, false);
+                break;
+            case IrNameMode::SaveAsDevice:
+                _switchScene(IrScene::Identify, false);
+                break;
+        }
+    }
+
+    void App09::_finishNameEditor()
+    {
+        char clean[40];
+        irstore::sanitiseName(_editBuf, clean, sizeof(clean));
+
+        switch (_nameMode) {
+        case IrNameMode::NewDevice: {
+            strncpy(_saveDevStem, clean, sizeof(_saveDevStem) - 1);
+            _saveDevStem[sizeof(_saveDevStem) - 1] = '\0';
+            char path[168];
+            irstore::devicePath(_saveDevStem, path, sizeof(path));
+            int n = irstore::countSignals(path);
+            snprintf(_editBuf, sizeof(_editBuf), "BTN_%d", (n > 0 ? n : 0) + 1);
+            _vkSel    = 0;
+            _nameMode = IrNameMode::Button;
+            _redraw();
+            break;
+        }
+        case IrNameMode::Button:
+            strncpy(_saveBtnName, clean, sizeof(_saveBtnName) - 1);
+            _saveBtnName[sizeof(_saveBtnName) - 1] = '\0';
+            _commitSave(false);
+            break;
+
+        case IrNameMode::RenameDevice: {
+            char newPath[168];
+            irstore::devicePath(clean, newPath, sizeof(newPath));
+            if (strcmp(clean, _devStem) == 0) {           /* unchanged */
+                _switchScene(IrScene::RemoteList, false);
+                break;
             }
-            if (nameLen == 0) strcpy(_editBuf, "Signal");
-
-            strncpy(_learnedSig.name, _editBuf, sizeof(_learnedSig.name) - 1);
-
-            char path[128];
-            snprintf(path, sizeof(path), "%s/%s.ir", IR_DIR, _editBuf);
-
-            bool ok;
-            if (SD_MMC.exists(path)) {
-                ok = _appendSignalToFile(path, _learnedSig);
-            } else {
-                ok = _saveSignalToFile(IR_DIR, _editBuf, _learnedSig);
+            if (!irstore::renameDevice(_devPath, newPath)) {
+                _toast("Name exists");
+                break;                                     /* stay in the editor */
             }
+            strncpy(_devStem, clean, sizeof(_devStem) - 1);
+            _devStem[sizeof(_devStem) - 1] = '\0';
+            strncpy(_devPath, newPath, sizeof(_devPath) - 1);
+            _devPath[sizeof(_devPath) - 1] = '\0';
+            /* Follow the device to its new position in the refreshed list. */
+            strncpy(_selectStem, _devStem, sizeof(_selectStem) - 1);
+            _selectStem[sizeof(_selectStem) - 1] = '\0';
+            _switchScene(IrScene::RemoteList, false);
+            _toast("Renamed");
+            break;
+        }
+        case IrNameMode::SaveAsDevice:
+            _saveIdentifiedDevice(clean);
+            break;
 
-            if (ok) {
-                _drawMsgBox("Signal saved!", path);
-            } else {
-                _drawMsgBox("Save FAILED!", "Check SD card");
+        case IrNameMode::RenameSignal: {
+            int idx = _confirmIndex;
+            if (idx < 0 || idx >= (int)_devSignals.size()) {
+                _switchScene(IrScene::RemoteView, false);
+                break;
             }
-            delay(1500);
-            _switchScene(IrScene::MainMenu);
+            int dup = irstore::findSignal(_devSignals, clean);
+            if (dup >= 0 && dup != idx) { _toast("Name exists"); break; }
+            strncpy(_devSignals[idx].name, clean, sizeof(_devSignals[idx].name) - 1);
+            _devSignals[idx].name[sizeof(_devSignals[idx].name) - 1] = '\0';
+            bool written = irstore::writeFile(_devPath, _devSignals);
+            if (!written) irstore::loadFile(_devPath, _devSignals);
+            _switchScene(IrScene::RemoteView, false);
+            _toast(written ? "Renamed" : "Write failed");
+            break;
+        }
         }
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Saved Remotes — File list
+     *  Save commit + duplicate resolution
+     * ════════════════════════════════════════════════════════════ */
+
+    void App09::_commitSave(bool replaceExisting)
+    {
+        char path[168];
+        irstore::devicePath(_saveDevStem, path, sizeof(path));
+
+        std::vector<irstore::Signal> sigs;
+        if (SD_MMC.exists(path)) irstore::loadFile(path, sigs);
+
+        int dup = irstore::findSignal(sigs, _saveBtnName);
+        if (dup >= 0 && !replaceExisting) {
+            _switchScene(IrScene::DupResolve);
+            return;
+        }
+
+        irstore::Signal s = _learned;
+        strncpy(s.name, _saveBtnName, sizeof(s.name) - 1);
+        s.name[sizeof(s.name) - 1] = '\0';
+
+        int target;
+        if (dup >= 0) { sigs[dup] = s; target = dup; }
+        else          { sigs.push_back(s); target = (int)sigs.size() - 1; }
+
+        if (!irstore::writeFile(path, sigs)) {
+            _toast("Save failed - check SD");
+            return;
+        }
+
+        _openDevice(_saveDevStem, target);
+        _toast("Saved: %s / %s", _saveDevStem, _saveBtnName);
+    }
+
+    void App09::_enterDupResolve()
+    {
+        auto& Lcd = _device->Lcd;
+        _rows.clear();
+        _subs.clear();
+        _rows.push_back("Replace");
+        _rows.push_back("Rename");
+        _rows.push_back("Cancel");
+
+        char title[40];
+        snprintf(title, sizeof(title), "%s exists", _saveBtnName);
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, title, nullptr);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Cancel");
+        _drawRows();
+    }
+
+    void App09::_runDupResolve()
+    {
+        if (_navList()) _drawRows();
+
+        if (_device->button.A.pressed()) {
+            switch (_sel) {
+                case 0: _commitSave(true); break;
+                case 1:
+                    strncpy(_editBuf, _saveBtnName, sizeof(_editBuf) - 1);
+                    _editBuf[sizeof(_editBuf) - 1] = '\0';
+                    _vkSel       = 0;
+                    _nameMode    = IrNameMode::Button;
+                    _nameFromDup = true;
+                    _switchScene(IrScene::NameEditor);
+                    break;
+                default: _switchScene(IrScene::LearnResult); break;
+            }
+            return;
+        }
+        if (_device->button.B.pressed()) _switchScene(IrScene::LearnResult);
+    }
+
+    /* ════════════════════════════════════════════════════════════
+     *  Remotes — device list
      * ════════════════════════════════════════════════════════════ */
 
     void App09::_enterRemoteList()
     {
-        _fileList.clear();
-        _listIrFiles(IR_DIR, _fileList);
-        _menuCount = _fileList.size();
+        auto& Lcd = _device->Lcd;
+        /* A bare repaint redraws the cached rows; only a real entry rescans. */
+        if (!_repaintOnly) {
+            _fileList.clear();
+            irstore::listIrFiles(irstore::kIrDir, _fileList);
 
-        _drawHeader("Saved Remotes");
-        _drawFooter3("[^v]Select", "[A]Open", "[B]Back");
-
-        if (_menuCount == 0) {
-            auto& Lcd = _device->Lcd;
-            hp::clearContent(Lcd);
-            Lcd.setFont(&fonts::efontCN_16);
-            Lcd.setTextColor(hp::COL_DIM, hp::COL_BG);
-            Lcd.setCursor(20, 80);
-            Lcd.print("No .ir files found");
-            Lcd.setCursor(20, 105);
-            Lcd.printf("Place in: %s/", IR_DIR);
-        } else {
-            int end = _menuCount < MENU2_VISIBLE ? _menuCount : MENU2_VISIBLE;
-            for (int i = 0; i < end; i++) {
-                String name = _fileList[i + _scrollOffset];
-                int dot = name.lastIndexOf('.');
-                if (dot >= 0) name = name.substring(0, dot);
-                _drawMenuItem2(MENU_Y0 + i * ITEM2_H, i,
-                               name.c_str(), "IR Remote", i == _menuSel);
+            _rows.clear();
+            _subs.clear();
+            for (const auto& f : _fileList) {
+                char path[168];
+                snprintf(path, sizeof(path), "%s/%s", irstore::kIrDir, f.c_str());
+                int n = irstore::countSignals(path);
+                char sub[24];
+                snprintf(sub, sizeof(sub), "%d buttons", n < 0 ? 0 : n);
+                _rows.push_back(stemOf(f));
+                _subs.push_back(sub);
             }
+        }
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Remotes", nullptr);
+        hp::clearContent(Lcd);
+
+        if (_rows.empty()) {
+            hp::drawFooter4(Lcd, nullptr, nullptr, nullptr, "[B]Back");
+            _drawCentered("No saved remotes", "Use Learn to add one",
+                          nullptr, nullptr, hp::COL_FG);
+        } else {
+            hp::drawFooter4(Lcd, "[^v]Move", "[A]Open", "[>]Opts", "[B]Back");
+            if (_selectStem[0]) {
+                for (size_t i = 0; i < _rows.size(); i++)
+                    if (strcasecmp(_rows[i].c_str(), _selectStem) == 0) {
+                        _selRemoteList = (int)i;
+                        break;
+                    }
+                _selectStem[0] = '\0';
+            }
+            _sel = _selRemoteList;
+            _drawRows();
         }
     }
 
     void App09::_runRemoteList()
     {
-        if (_menuCount == 0) {
+        if (_rows.empty()) {
             if (_device->button.B.pressed()) _switchScene(IrScene::MainMenu);
             return;
         }
 
-        bool redraw = false;
-
-        if (_device->button.Up.pressed()) {
-            if (_menuSel > 0) _menuSel--;
-            else if (_scrollOffset > 0) _scrollOffset--;
-            redraw = true;
-        }
-        if (_device->button.Down.pressed()) {
-            if (_menuSel < MENU2_VISIBLE - 1 && _menuSel < _menuCount - _scrollOffset - 1)
-                _menuSel++;
-            else if (_scrollOffset + MENU2_VISIBLE < _menuCount)
-                _scrollOffset++;
-            redraw = true;
-        }
-
-        if (redraw) {
-            int visible = _menuCount - _scrollOffset;
-            if (visible > MENU2_VISIBLE) visible = MENU2_VISIBLE;
-            for (int i = 0; i < MENU2_VISIBLE; i++) {
-                if (i < visible) {
-                    String name = _fileList[i + _scrollOffset];
-                    int dot = name.lastIndexOf('.');
-                    if (dot >= 0) name = name.substring(0, dot);
-                    _drawMenuItem2(MENU_Y0 + i * ITEM2_H, i,
-                                   name.c_str(), "IR Remote", i == _menuSel);
-                } else {
-                    _device->Lcd.fillRect(0, MENU_Y0 + i * ITEM2_H, SCR_W, ITEM2_H, hp::COL_BG);
-                }
-            }
-        }
+        if (_navList()) { _selRemoteList = _sel; _drawRows(); }
 
         if (_device->button.A.pressed()) {
-            int idx = _menuSel + _scrollOffset;
-            char path[128];
-            snprintf(path, sizeof(path), "%s/%s", IR_DIR, _fileList[idx].c_str());
+            _selRemoteList = _sel;
+            _openDevice(_rows[_sel].c_str());
+            return;
+        }
+        if (_device->button.Right.pressed()) {
+            _selRemoteList = _sel;
+            strncpy(_devStem, _rows[_sel].c_str(), sizeof(_devStem) - 1);
+            _devStem[sizeof(_devStem) - 1] = '\0';
+            irstore::devicePath(_devStem, _devPath, sizeof(_devPath));
+            _switchScene(IrScene::DeviceOptions);
+            return;
+        }
+        if (_device->button.B.pressed()) _switchScene(IrScene::MainMenu);
+    }
 
-            if (_loadRemote(path, _currentRemote)) {
-                _switchScene(IrScene::RemoteView);
-            } else {
-                _drawMsgBox("Failed to load!", path);
-                delay(1500);
-                _sceneDirty = true;
+    void App09::_enterDeviceOptions()
+    {
+        auto& Lcd = _device->Lcd;
+        _rows.clear();
+        _subs.clear();
+        _rows.push_back("Learn new button");
+        _rows.push_back("Rename");
+        _rows.push_back("Delete");
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, _devStem, "OPTS", hp::COL_FG);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Back");
+        _drawRows();
+    }
+
+    void App09::_runDeviceOptions()
+    {
+        if (_navList()) _drawRows();
+
+        if (_device->button.A.pressed()) {
+            switch (_sel) {
+            case 0:
+                _startLearn(_devStem);
+                break;
+            case 1:
+                strncpy(_editBuf, _devStem, sizeof(_editBuf) - 1);
+                _editBuf[sizeof(_editBuf) - 1] = '\0';
+                _vkSel    = 0;
+                _nameMode = IrNameMode::RenameDevice;
+                _switchScene(IrScene::NameEditor);
+                break;
+            default:
+                _confirmKind = IrConfirmKind::DeleteDevice;
+                snprintf(_confirmLine, sizeof(_confirmLine), "Delete %s?", _devStem);
+                _switchScene(IrScene::Confirm);
+                break;
             }
+            return;
         }
-        if (_device->button.B.pressed()) {
-            _switchScene(IrScene::MainMenu);
-        }
+        if (_device->button.B.pressed()) _switchScene(IrScene::RemoteList, false);
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Remote View — Show signals, send on A
+     *  Remotes — device view (buttons)
      * ════════════════════════════════════════════════════════════ */
+
+    void App09::_openDevice(const char* stem, int selectSignal)
+    {
+        strncpy(_devStem, stem, sizeof(_devStem) - 1);
+        _devStem[sizeof(_devStem) - 1] = '\0';
+        irstore::devicePath(_devStem, _devPath, sizeof(_devPath));
+        _devSignals.clear();
+        irstore::loadFile(_devPath, _devSignals);
+
+        _switchScene(IrScene::RemoteView);
+        if (selectSignal < 0) selectSignal = 0;
+        if (selectSignal > (int)_devSignals.size()) selectSignal = (int)_devSignals.size();
+        _selRemoteView = selectSignal;
+        _sel           = selectSignal;
+    }
 
     void App09::_enterRemoteView()
     {
-        _menuCount = _currentRemote.signals.size();
-
-        _drawHeader(_currentRemote.filename);
-        _drawFooter3("[^v]Select", "[A]Send", "[B]Back");
-
-        if (_menuCount == 0) {
-            auto& Lcd = _device->Lcd;
-            hp::clearContent(Lcd);
-            Lcd.setFont(&fonts::efontCN_16);
-            Lcd.setTextColor(hp::COL_DIM, hp::COL_BG);
-            Lcd.setCursor(20, 80);
-            Lcd.print("Empty remote (no signals)");
-        } else {
-            int end = _menuCount < MENU2_VISIBLE ? _menuCount : MENU2_VISIBLE;
-            for (int i = 0; i < end; i++) {
-                const IrSignal& sig = _currentRemote.signals[i + _scrollOffset];
-                char sub[40];
-                if (sig.isRaw) {
-                    snprintf(sub, sizeof(sub), "RAW  %d samples", (int)sig.rawData.size());
-                } else {
-                    snprintf(sub, sizeof(sub), "%s  0x%llX",
-                             typeToString(sig.protocol, false).c_str(), sig.value);
-                }
-                _drawMenuItem2(MENU_Y0 + i * ITEM2_H, i, sig.name, sub, i == _menuSel);
-            }
+        auto& Lcd = _device->Lcd;
+        _rows.clear();
+        _subs.clear();
+        for (const auto& s : _devSignals) {
+            char sub[40];
+            if (s.isRaw) snprintf(sub, sizeof(sub), "RAW %d", (int)s.raw.size());
+            else         snprintf(sub, sizeof(sub), "%s A:%02X C:%02X",
+                                  (s.proto == irfc::Proto::Unknown && s.protoRaw[0])
+                                      ? s.protoRaw : irfc::protoName(s.proto),
+                                  (unsigned)s.address,
+                                  (unsigned)s.command);
+            _rows.push_back(s.name);
+            _subs.push_back(sub);
         }
+        _rows.push_back("+ Learn new button");
+        _subs.push_back("");
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, _devStem, nullptr);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Send", "[>]Opts", "[B]Back");
+        _sel = _selRemoteView;
+        _drawRows();
     }
 
     void App09::_runRemoteView()
     {
-        if (_menuCount == 0) {
-            if (_device->button.B.pressed()) _switchScene(IrScene::RemoteList);
-            return;
-        }
+        if (_navList()) { _selRemoteView = _sel; _drawRows(); }
 
-        bool redraw = false;
-
-        if (_device->button.Up.pressed()) {
-            if (_menuSel > 0) _menuSel--;
-            else if (_scrollOffset > 0) _scrollOffset--;
-            redraw = true;
-        }
-        if (_device->button.Down.pressed()) {
-            if (_menuSel < MENU2_VISIBLE - 1 && _menuSel < _menuCount - _scrollOffset - 1) _menuSel++;
-            else if (_scrollOffset + MENU2_VISIBLE < _menuCount) _scrollOffset++;
-            redraw = true;
-        }
-
-        if (redraw) {
-            int visible = _menuCount - _scrollOffset;
-            if (visible > MENU2_VISIBLE) visible = MENU2_VISIBLE;
-            for (int i = 0; i < MENU2_VISIBLE; i++) {
-                int dataIdx = i + _scrollOffset;
-                if (i < visible) {
-                    const IrSignal& sig = _currentRemote.signals[dataIdx];
-                    char sub[40];
-                    if (sig.isRaw) {
-                        snprintf(sub, sizeof(sub), "RAW  %d samples", (int)sig.rawData.size());
-                    } else {
-                        snprintf(sub, sizeof(sub), "%s  0x%llX",
-                                 typeToString(sig.protocol, false).c_str(), sig.value);
-                    }
-                    _drawMenuItem2(MENU_Y0 + i * ITEM2_H, i, sig.name, sub, i == _menuSel);
-                } else {
-                    _device->Lcd.fillRect(0, MENU_Y0 + i * ITEM2_H, SCR_W, ITEM2_H, hp::COL_BG);
-                }
-            }
-        }
+        const int nSig    = (int)_devSignals.size();
+        const bool onLearn = (_sel >= nSig);
 
         if (_device->button.A.pressed()) {
-            int idx = _menuSel + _scrollOffset;
-            _txSignal(_currentRemote.signals[idx]);
-            hp::drawToast(_device->Lcd, "SENT", hp::COL_FG);
-            delay(200);
-            _sceneDirty = true;
+            if (onLearn) {
+                _startLearn(_devStem);
+            } else {
+                char label[48];
+                snprintf(label, sizeof(label), "Sent %s", _devSignals[_sel].name);
+                _sendOrToast(_devSignals[_sel], label);
+            }
+            return;
+        }
+        if (_device->button.Right.pressed() && !onLearn) {
+            _selRemoteView = _sel;
+            _confirmIndex  = _sel;
+            _switchScene(IrScene::SignalOptions);
+            return;
+        }
+        if (_device->button.B.pressed()) _switchScene(IrScene::RemoteList);
+    }
+
+    void App09::_enterSignalOptions()
+    {
+        auto& Lcd = _device->Lcd;
+        _rows.clear();
+        _subs.clear();
+        _rows.push_back("Rename");
+        _rows.push_back("Delete");
+
+        const char* name = (_confirmIndex >= 0 && _confirmIndex < (int)_devSignals.size())
+                           ? _devSignals[_confirmIndex].name : "Signal";
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, name, "OPTS", hp::COL_FG);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Back");
+        _drawRows();
+    }
+
+    void App09::_runSignalOptions()
+    {
+        if (_navList()) _drawRows();
+
+        if (_device->button.A.pressed()) {
+            if (_confirmIndex < 0 || _confirmIndex >= (int)_devSignals.size()) {
+                _switchScene(IrScene::RemoteView, false);
+                return;
+            }
+            if (_sel == 0) {
+                strncpy(_editBuf, _devSignals[_confirmIndex].name, sizeof(_editBuf) - 1);
+                _editBuf[sizeof(_editBuf) - 1] = '\0';
+                _vkSel    = 0;
+                _nameMode = IrNameMode::RenameSignal;
+                _switchScene(IrScene::NameEditor);
+            } else {
+                _confirmKind = IrConfirmKind::DeleteSignal;
+                snprintf(_confirmLine, sizeof(_confirmLine), "Delete %s?",
+                         _devSignals[_confirmIndex].name);
+                _switchScene(IrScene::Confirm);
+            }
+            return;
+        }
+        if (_device->button.B.pressed()) _switchScene(IrScene::RemoteView, false);
+    }
+
+    /* ════════════════════════════════════════════════════════════
+     *  Confirm dialog
+     * ════════════════════════════════════════════════════════════ */
+
+    void App09::_enterConfirm()
+    {
+        auto& Lcd = _device->Lcd;
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Confirm", "!", hp::COL_WARN);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[A]Yes", nullptr, nullptr, "[B]No");
+        hp::drawDialog(Lcd, _confirmLine, nullptr, hp::COL_WARN);
+    }
+
+    void App09::_runConfirm()
+    {
+        if (_device->button.A.pressed()) {
+            if (_confirmKind == IrConfirmKind::DeleteDevice) {
+                const bool gone = irstore::removeDevice(_devPath);
+                _confirmKind   = IrConfirmKind::None;
+                _selRemoteList = 0;
+                _switchScene(IrScene::RemoteList);
+                _toast(gone ? "Deleted" : "Delete failed");
+            } else if (_confirmKind == IrConfirmKind::DeleteSignal) {
+                bool ok = true;
+                if (_confirmIndex >= 0 && _confirmIndex < (int)_devSignals.size()) {
+                    _devSignals.erase(_devSignals.begin() + _confirmIndex);
+                    ok = irstore::writeFile(_devPath, _devSignals);
+                    if (!ok) irstore::loadFile(_devPath, _devSignals);
+                    /* Keep the highlight on a real button, not on the trailing
+                     * "+ Learn new button" row, after the list shrank. */
+                    if (!_devSignals.empty() && _selRemoteView >= (int)_devSignals.size())
+                        _selRemoteView = (int)_devSignals.size() - 1;
+                }
+                _confirmKind = IrConfirmKind::None;
+                _switchScene(IrScene::RemoteView);
+                _toast(ok ? "Deleted" : "Write failed");
+            } else {
+                _switchScene(_prevScene, false);
+            }
+            return;
         }
         if (_device->button.B.pressed()) {
-            _switchScene(IrScene::RemoteList);
+            IrConfirmKind k = _confirmKind;
+            _confirmKind = IrConfirmKind::None;
+            _switchScene(k == IrConfirmKind::DeleteDevice ? IrScene::DeviceOptions
+                                                          : IrScene::SignalOptions, false);
         }
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Universal Remote Menu
+     *  Universal (all brands)
      * ════════════════════════════════════════════════════════════ */
-
-    /* Helper: build the subtitle string for a universal-menu item. */
-    static const char* _univMenuSub(const char* stem) {
-        int idx = univCatIndex(stem);
-        return (idx >= 0 && idx < kUnivKnownCount) ? kUnivSubtitles[idx] : "IR device control";
-    }
 
     void App09::_enterUniversalMenu()
     {
-        _fileList.clear();
-        _listIrFiles(UNIV_DIR, _fileList);
-        _menuCount = _fileList.size();
+        auto& Lcd = _device->Lcd;
+        if (!_repaintOnly) {
+            _fileList.clear();
+            irstore::listIrFiles(irstore::kUnivDir, _fileList);
 
-        _drawHeader("Universal Remote");
-        _drawFooter3("[^v]Select", "[A]Enter", "[B]Back");
-
-        if (_menuCount == 0) {
-            auto& Lcd = _device->Lcd;
-            hp::clearContent(Lcd);
-            Lcd.setFont(&fonts::efontCN_16);
-            Lcd.setTextColor(hp::COL_DIM, hp::COL_BG);
-            Lcd.setCursor(20, 80);
-            Lcd.print("No .ir files found");
-            Lcd.setCursor(20, 105);
-            Lcd.printf("Place in: %s/", UNIV_DIR);
-        } else {
-            int end = _menuCount < MENU2_VISIBLE ? _menuCount : MENU2_VISIBLE;
-            for (int i = 0; i < end; i++) {
-                String name = univDisplayName(_fileList[i + _scrollOffset]);
-                String stem = _fileList[i + _scrollOffset];
-                int dot = stem.lastIndexOf('.');
-                if (dot >= 0) stem = stem.substring(0, dot);
-                _drawMenuItem2(MENU_Y0 + i * ITEM2_H, i, name.c_str(),
-                               _univMenuSub(stem.c_str()), i == _menuSel);
+            _rows.clear();
+            _subs.clear();
+            for (const auto& f : _fileList) {
+                _rows.push_back(univDisplayName(f));
+                _subs.push_back(f);
             }
+        }
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, "Universal · all brands", nullptr);
+        hp::clearContent(Lcd);
+
+        if (_rows.empty()) {
+            hp::drawFooter4(Lcd, nullptr, nullptr, nullptr, "[B]Back");
+            _drawCentered("Universal library not on SD card",
+                          "Copy  sd files/infrared/universal/",
+                          "from the firmware repo to",
+                          "SD:/infrared/universal/",
+                          hp::COL_FG);
+        } else {
+            hp::drawFooter4(Lcd, "[^v]Move", "[A]Open", nullptr, "[B]Back");
+            _sel = _selUnivMenu;
+            _drawRows();
         }
     }
 
     void App09::_runUniversalMenu()
     {
-        if (_menuCount == 0) {
+        if (_rows.empty()) {
             if (_device->button.B.pressed()) _switchScene(IrScene::MainMenu);
             return;
         }
 
-        bool redraw = false;
-        if (_device->button.Up.pressed()) {
-            if (_menuSel > 0) _menuSel--;
-            else if (_scrollOffset > 0) _scrollOffset--;
-            redraw = true;
-        }
-        if (_device->button.Down.pressed()) {
-            if (_menuSel < MENU2_VISIBLE - 1 && _menuSel < _menuCount - _scrollOffset - 1)
-                _menuSel++;
-            else if (_scrollOffset + MENU2_VISIBLE < _menuCount)
-                _scrollOffset++;
-            redraw = true;
-        }
-
-        if (redraw) {
-            int visible = _menuCount - _scrollOffset;
-            if (visible > MENU2_VISIBLE) visible = MENU2_VISIBLE;
-            for (int i = 0; i < MENU2_VISIBLE; i++) {
-                if (i < visible) {
-                    String name = univDisplayName(_fileList[i + _scrollOffset]);
-                    String stem = _fileList[i + _scrollOffset];
-                    int dot = stem.lastIndexOf('.');
-                    if (dot >= 0) stem = stem.substring(0, dot);
-                    _drawMenuItem2(MENU_Y0 + i * ITEM2_H, i, name.c_str(),
-                                   _univMenuSub(stem.c_str()), i == _menuSel);
-                } else {
-                    _device->Lcd.fillRect(0, MENU_Y0 + i * ITEM2_H, SCR_W, ITEM2_H, hp::COL_BG);
-                }
-            }
-        }
+        if (_navList()) { _selUnivMenu = _sel; _drawRows(); }
 
         if (_device->button.A.pressed()) {
-            int dataIdx = _menuSel + _scrollOffset;
-
-            String stem = _fileList[dataIdx];
-            int dot = stem.lastIndexOf('.');
-            if (dot >= 0) stem = stem.substring(0, dot);
-
-            String dispName = univDisplayName(_fileList[dataIdx]);
-            strncpy(_univCatTitle, dispName.c_str(), sizeof(_univCatTitle) - 1);
-            _univCatTitle[sizeof(_univCatTitle) - 1] = '\0';
-
-            char path[128];
-            snprintf(path, sizeof(path), "%s/%s", UNIV_DIR, _fileList[dataIdx].c_str());
-
-            int catIdx = univCatIndex(stem.c_str());
-            _univBlastIdx = catIdx;
-            _vbSel = 0;
-            _univBlastQ.clear();
-            _univBlastName[0] = '\0';
-
-            if (catIdx >= 0) {
-                /* Known category: button panel is hardcoded — no preload needed.
-                 * Filtered load happens per-button in _runUniversalTV so every
-                 * brand's signal is available without any signal-count cap. */
-                _currentRemote.signals.clear();
-                strncpy(_currentRemote.path, path, sizeof(_currentRemote.path) - 1);
-                _currentRemote.path[sizeof(_currentRemote.path) - 1] = '\0';
-            } else {
-                /* Unknown category: load all signals (capped) to use as buttons. */
-                hp::drawHeader(_device->Lcd, _univCatTitle, "Reading...", hp::COL_WARN);
-                bool loaded = _loadRemote(path, _currentRemote, 100);
-                if (!loaded) {
-                    hp::drawDialog(_device->Lcd, "File not found!", path, hp::COL_ERR);
-                    delay(1500);
-                    _sceneDirty = true;
-                    return;
-                }
-            }
-            _switchScene(IrScene::UniversalTV);
-        }
-        if (_device->button.B.pressed()) {
-            _switchScene(IrScene::MainMenu);
-        }
-    }
-
-    /* ════════════════════════════════════════════════════════════
-     *  Universal Remote — Virtual button panel (directional nav)
-     *  2-column grid for the selected device category.
-     *  Up/Down/Left/Right moves selection; A sends; B back.
-     *  Special: when category == TV and POWER is selected, A launches
-     *  TV-B-Gone mode (iterate every signal in tv.ir).
-     * ════════════════════════════════════════════════════════════ */
-
-    void App09::_enterUniversalTV()
-    {
-        auto& Lcd = _device->Lcd;
-        hp::drawChrome(Lcd);
-        hp::drawHeader(Lcd, _univCatTitle, "REMOTE", hp::COL_FG);
-        hp::drawFooter3(Lcd, "[^v<>]Select", "[A]Blast", "[B]Back");
-
-        if (_univBlastIdx >= 0 && _univBlastIdx < kUnivKnownCount) {
-            /* Known category: use hardcoded button definitions */
-            int numBtns = kVBtnsCount[_univBlastIdx];
-            const VBtnDef* btns = kVBtnsDefs[_univBlastIdx];
-            if (_vbSel < 0 || _vbSel >= numBtns) _vbSel = 0;
-            for (int i = 0; i < numBtns; i++) {
-                int bx, by, bw, bh;
-                _getVBtnRect(i, numBtns, bx, by, bw, bh);
-                hp::drawVirtualButton(Lcd, bx, by, bw, bh, btns[i].label, i == _vbSel);
-            }
-        } else {
-            /* Generic category: use signal names from the loaded remote as buttons */
-            int numBtns = (int)_currentRemote.signals.size();
-            if (numBtns > 12) numBtns = 12;
-            if (_vbSel < 0 || _vbSel >= numBtns) _vbSel = 0;
-            if (numBtns == 0) {
-                Lcd.setTextColor(COL_FG_DIM, COL_BG);
-                Lcd.setCursor(20, 80);
-                Lcd.print("No signals in file");
-            } else {
-                for (int i = 0; i < numBtns; i++) {
-                    int bx, by, bw, bh;
-                    _getVBtnRect(i, numBtns, bx, by, bw, bh);
-                    hp::drawVirtualButton(Lcd, bx, by, bw, bh,
-                                          _currentRemote.signals[i].name, i == _vbSel);
-                }
-            }
-        }
-    }
-
-    void App09::_runUniversalTV()
-    {
-        if (_device->button.B.pressed()) {
-            _switchScene(IrScene::UniversalMenu);
-            return;
-        }
-
-        bool knownCat = (_univBlastIdx >= 0 && _univBlastIdx < kUnivKnownCount);
-        int numBtns = knownCat
-            ? kVBtnsCount[_univBlastIdx]
-            : (int)_currentRemote.signals.size();
-        if (numBtns > 12 && !knownCat) numBtns = 12;
-        if (numBtns == 0) return;
-
-        int rows   = (numBtns + 1) / 2;
-        int oldSel = _vbSel;
-        int row    = _vbSel / 2;
-        int col    = _vbSel % 2;
-
-        if (_device->button.Up.pressed())    { row = (row - 1 + rows) % rows; }
-        if (_device->button.Down.pressed())  { row = (row + 1) % rows; }
-        if (_device->button.Left.pressed())  { col = (col - 1 + 2) % 2; }
-        if (_device->button.Right.pressed()) { col = (col + 1) % 2; }
-
-        int newSel = row * 2 + col;
-        if (newSel >= numBtns) newSel = numBtns - 1;
-        if (newSel != oldSel) {
-            _vbSel = newSel;
             auto& Lcd = _device->Lcd;
-            int bx, by, bw, bh;
-            if (knownCat) {
-                const VBtnDef* btns = kVBtnsDefs[_univBlastIdx];
-                _getVBtnRect(oldSel, numBtns, bx, by, bw, bh);
-                hp::drawVirtualButton(Lcd, bx, by, bw, bh, btns[oldSel].label, false);
-                _getVBtnRect(newSel, numBtns, bx, by, bw, bh);
-                hp::drawVirtualButton(Lcd, bx, by, bw, bh, btns[newSel].label, true);
-            } else {
-                _getVBtnRect(oldSel, numBtns, bx, by, bw, bh);
-                hp::drawVirtualButton(Lcd, bx, by, bw, bh, _currentRemote.signals[oldSel].name, false);
-                _getVBtnRect(newSel, numBtns, bx, by, bw, bh);
-                hp::drawVirtualButton(Lcd, bx, by, bw, bh, _currentRemote.signals[newSel].name, true);
+            _selUnivMenu = _sel;
+            const String& file = _fileList[_sel];
+            String stem = stemOf(file);
+
+            snprintf(_univPath, sizeof(_univPath), "%s/%s", irstore::kUnivDir, file.c_str());
+            strncpy(_univTitle, univDisplayName(file).c_str(), sizeof(_univTitle) - 1);
+            _univTitle[sizeof(_univTitle) - 1] = '\0';
+            _univCat = univCatIndex(stem.c_str());
+
+            /* One chunked pass builds name → offsets; nothing else reads the
+             * whole file, so memory stays bounded by one signal afterwards. */
+            hp::drawLoadingBegin(Lcd, "Indexing library...", file.c_str());
+            bool ok = irstore::buildIndex(_univPath, _univIndex, _irIndexTick, _device);
+            /* _irIndexTick polled the buttons; discard the edges it latched so
+             * a press made during indexing cannot fire a blast on entry. */
+            _drainInput();
+            if (!ok || _univIndex.all.empty()) {
+                /* A long-press B abort is handled by onRunning on the next frame. */
+                if (!_device->button.B.isLongPress())
+                    _toast("Cannot read %s", file.c_str());
+                _redraw();
+                return;
             }
-        }
-
-        if (_device->button.A.pressed()) {
-            const char* sigName;
-            const char* btnLabel;
-            if (knownCat) {
-                sigName  = kVBtnsDefs[_univBlastIdx][_vbSel].sigName;
-                btnLabel = kVBtnsDefs[_univBlastIdx][_vbSel].label;
-            } else {
-                int idx = (_vbSel < (int)_currentRemote.signals.size()) ? _vbSel : 0;
-                sigName  = _currentRemote.signals[idx].name;
-                btnLabel = sigName;
-            }
-            strncpy(_univBlastName, btnLabel, sizeof(_univBlastName) - 1);
-            _univBlastName[sizeof(_univBlastName) - 1] = '\0';
-
-            if (knownCat) {
-                /* Known category: load the .ir file filtered to only signals
-                 * matching this button's sigName.  No maxSignals cap — the
-                 * filter itself bounds memory to (brands × 1 signal). */
-                hp::drawHeader(_device->Lcd, _univCatTitle, "Loading...", hp::COL_WARN);
-                bool loaded = _loadRemote(_currentRemote.path, _currentRemote, 0, sigName);
-                if (!loaded || _currentRemote.signals.empty()) {
-                    hp::drawDialog(_device->Lcd, "No signals for:", sigName, hp::COL_ERR);
-                    delay(1500);
-                    _sceneDirty = true;
-                    return;
-                }
-                /* Every loaded signal is already the target action → queue = all */
-                _univBlastQ.clear();
-                for (int i = 0; i < (int)_currentRemote.signals.size(); i++)
-                    _univBlastQ.push_back(i);
-            } else {
-                /* Unknown category: filter from already-loaded signals */
-                _univBlastQ.clear();
-                for (int i = 0; i < (int)_currentRemote.signals.size(); i++) {
-                    if (strcasecmp(_currentRemote.signals[i].name, sigName) == 0)
-                        _univBlastQ.push_back(i);
-                }
-                if (_univBlastQ.empty()) {
-                    for (int i = 0; i < (int)_currentRemote.signals.size(); i++)
-                        _univBlastQ.push_back(i);
-                }
-            }
-
-            _switchScene(IrScene::TVBGone);
-        }
-    }
-
-    void App09::_runUniversalBlast(const char* triggerLabel)
-    {
-        auto& Lcd = _device->Lcd;
-        const int total = (int)_currentRemote.signals.size();
-        if (total <= 0) {
-            hp::drawDialog(Lcd, "No signals loaded", "Check /infrared/universal", hp::COL_ERR);
-            delay(1200);
-            _sceneDirty = true;
+            _vbSel       = 0;
+            _selUnivCat  = 0;
+            _switchScene(IrScene::UniversalCat);
             return;
         }
-
-        const char* action = (triggerLabel && triggerLabel[0]) ? triggerLabel : "UNIVERSAL";
-        _device->led.setColor(WS2812B_Class::RED);
-
-        for (int i = 0; i < total; i++) {
-            const IrSignal& sig = _currentRemote.signals[i];
-            const char* sigName = (sig.name[0] != '\0') ? sig.name : "(unnamed)";
-            float pct = (float)i / (float)total;
-            hp::drawExecPopup(Lcd, "UNIVERSAL TX", action, sigName, pct, i, total, hp::COL_WARN);
-
-            _txSignal(sig);
-            delay(120);
-        }
-
-        hp::drawExecPopup(Lcd, "UNIVERSAL TX", action, "Batch complete", 1.0f, total, total, hp::COL_FG);
-        _device->led.setColor(WS2812B_Class::GREEN);
-        delay(260);
-        _device->led.off();
-        _sceneDirty = true;
+        if (_device->button.B.pressed()) _switchScene(IrScene::MainMenu);
     }
 
-    /* ════════════════════════════════════════════════════════════
-     *  TV-B-Gone — iterate every signal in the loaded tv.ir
-     *  State machine:
-     *    Idle    : A=Start, B=Back, ^v navigate signal
-     *    Running : A=Pause, B=Stop (→Idle)
-     *    Paused  : A=Send 1 (current signal), B=Resume (→Running),
-     *              ^v navigate signal
-     * ════════════════════════════════════════════════════════════ */
-
-    void App09::_drawTVBGoneFooter()
-    {
-        switch (_tvbgState) {
-            case TvbgState::Idle:
-                _drawFooter3("[^v]Sel", "[A]Start", "[B]Back");
-                break;
-            case TvbgState::Running:
-                _drawFooter3(nullptr, "[A]Pause", "[B]Stop");
-                break;
-            case TvbgState::Paused:
-                _drawFooter3("[^v]Sel", "[A]Send 1", "[B]Resume");
-                break;
-        }
-    }
-
-    void App09::_drawTVBGoneFrame()
+    void App09::_enterUniversalCat()
     {
         auto& Lcd = _device->Lcd;
-        const int bw = 280, bh = 160;
-        const int bx = (hp::W - bw) / 2, by = (hp::H - bh) / 2;
-        uint16_t bd;
-        const char* title;
-        switch (_tvbgState) {
-            case TvbgState::Idle:    bd = hp::COL_DIM;  title = "[ READY ]";       break;
-            case TvbgState::Paused:  bd = hp::COL_WARN; title = "[ PAUSED ]";      break;
-            case TvbgState::Running:
-            default:                 bd = hp::COL_FG;   title = "[ SENDING... ]";  break;
-        }
+        if (!_repaintOnly) _univCloseFile();
+        char title[48];
+        snprintf(title, sizeof(title), "%s · all brands", _univTitle);
 
-        Lcd.fillRect(bx, by, bw, bh, hp::COL_BG);
-        Lcd.drawRect(bx,     by,     bw,     bh,     bd);
-        Lcd.drawRect(bx + 2, by + 2, bw - 4, bh - 4, hp::COL_DIM);
-
-        Lcd.setFont(&fonts::efontCN_16);
-
-        /* Title bar */
-        Lcd.setTextColor(hp::COL_ACCENT, hp::COL_BG);
-        int tw = (int)strlen(title) * 8;
-        Lcd.setCursor(bx + (bw - tw) / 2, by + 8);
-        Lcd.print(title);
-
-        /* Two-line message — button name + category */
-        char line1[48];
-        snprintf(line1, sizeof(line1), "[ %s ]", _univBlastName[0] ? _univBlastName : "Signal");
-        char line2buf[48];
-        snprintf(line2buf, sizeof(line2buf), "%s — all brands",
-                 _univCatTitle[0] ? _univCatTitle : "Universal");
-        const char* line2 = line2buf;
-        Lcd.setTextColor(hp::COL_FG, hp::COL_BG);
-        int t1 = (int)strlen(line1) * 8;
-        int t2 = (int)strlen(line2) * 8;
-        Lcd.setCursor(bx + (bw - t1) / 2, by + 28);
-        Lcd.print(line1);
-        Lcd.setCursor(bx + (bw - t2) / 2, by + 44);
-        Lcd.print(line2);
-
-        /* Currently-selected signal name */
-        int total = _tvbgTotal > 0 ? _tvbgTotal : 1;
-        int cur   = _tvbgIdx; if (cur > total) cur = total;
-        int dispIdx = cur < total ? cur : total - 1;
-        char sigBuf[40];
-        if (_tvbgTotal > 0 && dispIdx >= 0) {
-            int rawIdx = _univBlastQ.empty() ? dispIdx : _univBlastQ[dispIdx];
-            snprintf(sigBuf, sizeof(sigBuf), "> %s",
-                     _currentRemote.signals[rawIdx].name);
-        } else {
-            snprintf(sigBuf, sizeof(sigBuf), "> (no signals)");
-        }
-        Lcd.setTextColor(hp::COL_ACCENT, hp::COL_BG);
-        int sw = (int)strlen(sigBuf) * 8;
-        if (sw > bw - 16) sw = bw - 16;
-        Lcd.setCursor(bx + (bw - sw) / 2, by + 64);
-        Lcd.print(sigBuf);
-
-        /* Big percentage */
-        int pct = (cur * 100) / total;
-        char pctBuf[8]; snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-        Lcd.setTextSize(2);
-        Lcd.setTextColor(hp::COL_ACCENT, hp::COL_BG);
-        int pw = (int)strlen(pctBuf) * 16;
-        Lcd.setCursor(bx + (bw - pw) / 2, by + 84);
-        Lcd.print(pctBuf);
-        Lcd.setTextSize(1);
-
-        /* "cur/total" */
-        char cntBuf[16]; snprintf(cntBuf, sizeof(cntBuf), "%d/%d", cur, total);
-        Lcd.setTextColor(hp::COL_DIM, hp::COL_BG);
-        int cw = (int)strlen(cntBuf) * 8;
-        Lcd.setCursor(bx + (bw - cw) / 2, by + 118);
-        Lcd.print(cntBuf);
-
-        /* Progress bar */
-        int barX = bx + 14, barY = by + 136, barW = bw - 28;
-        Lcd.drawRect(barX, barY, barW, 10, bd);
-        int filled = ((barW - 4) * cur) / total;
-        if (filled > 0) Lcd.fillRect(barX + 2, barY + 2, filled, 6, bd);
-        Lcd.fillRect(barX + 2 + filled, barY + 2, barW - 4 - filled, 6, hp::COL_BG);
-    }
-
-    void App09::_enterTVBGone()
-    {
-        auto& Lcd = _device->Lcd;
         hp::drawChrome(Lcd);
-        const char* badge = _univBlastName[0] ? _univBlastName : "TX";
-        hp::drawHeader(Lcd, _univCatTitle[0] ? _univCatTitle : "Universal", badge, hp::COL_WARN);
+        hp::drawHeader(Lcd, title, nullptr);
+        hp::clearContent(Lcd);
+        _rows.clear();
+        _subs.clear();
 
-        _tvbgIdx      = 0;
-        _tvbgTotal    = _univBlastQ.empty()
-                        ? (int)_currentRemote.signals.size()
-                        : (int)_univBlastQ.size();
-        _tvbgState    = TvbgState::Idle;
-        _tvbgPaused   = false;
-        _tvbgLastSend = 0;
-        _device->led.off();
-
-        _drawTVBGoneFooter();
-        _drawTVBGoneFrame();
+        if (_univCat >= 0 && _univCat < kUnivKnownCount) {
+            hp::drawFooter4(Lcd, "[^v<>]Move", "[A]Blast", nullptr, "[B]Back");
+            const VBtnDef* btns = kVBtnsDefs[_univCat];
+            int n = kVBtnsCount[_univCat];
+            if (_univCat == kUnivCatTV) n++;                 /* + TV-B-Gone */
+            if (_vbSel < 0 || _vbSel >= n) _vbSel = 0;
+            for (int i = 0; i < n; i++) {
+                int bx, by, bw, bh;
+                _getVBtnRect(i, n, bx, by, bw, bh);
+                const char* label = (_univCat == kUnivCatTV && i == n - 1)
+                                    ? kTvbgLabel : btns[i].label;
+                hp::drawVirtualButton(Lcd, bx, by, bw, bh, label, i == _vbSel);
+            }
+        } else {
+            hp::drawFooter4(Lcd, "[^v]Move", "[A]Blast", nullptr, "[B]Back");
+            for (const auto& n : _univIndex.names) _rows.push_back(n);
+            _sel   = _selUnivCat;                             /* restore selection */
+            _vbSel = _sel;
+            _drawRows();
+        }
     }
 
-    void App09::_runTVBGone()
+    void App09::_runUniversalCat()
     {
-        /* Up/Down navigates current signal (Idle / Paused only) */
-        if (_tvbgState != TvbgState::Running && _tvbgTotal > 0) {
-            bool nav = false;
-            if (_device->button.Up.pressed()   && _tvbgIdx > 0)              { _tvbgIdx--; nav = true; }
-            if (_device->button.Down.pressed() && _tvbgIdx < _tvbgTotal - 1) { _tvbgIdx++; nav = true; }
-            if (nav) _drawTVBGoneFrame();
-        }
+        auto& Lcd = _device->Lcd;
+        const bool known = (_univCat >= 0 && _univCat < kUnivKnownCount);
 
-        /* B = state-dependent */
         if (_device->button.B.pressed()) {
-            switch (_tvbgState) {
-                case TvbgState::Idle:
-                    _device->led.off();
-                    _switchScene(_prevScene);
-                    return;
-                case TvbgState::Running:
-                    /* Stop → back to Idle, keep position */
-                    _tvbgState = TvbgState::Idle;
-                    _device->led.off();
-                    _drawTVBGoneFooter();
-                    _drawTVBGoneFrame();
-                    return;
-                case TvbgState::Paused:
-                    /* Resume */
-                    _tvbgState = TvbgState::Running;
-                    _tvbgPaused = false;
-                    _tvbgLastSend = 0;
-                    _device->led.setColor(WS2812B_Class::RED);
-                    _drawTVBGoneFooter();
-                    _drawTVBGoneFrame();
-                    return;
-            }
-        }
-
-        /* A = state-dependent */
-        if (_device->button.A.pressed()) {
-            switch (_tvbgState) {
-                case TvbgState::Idle:
-                    if (_tvbgTotal <= 0) return;
-                    /* Start: if at end, restart from 0 */
-                    if (_tvbgIdx >= _tvbgTotal) _tvbgIdx = 0;
-                    _tvbgState = TvbgState::Running;
-                    _tvbgLastSend = 0;
-                    _device->led.setColor(WS2812B_Class::RED);
-                    _drawTVBGoneFooter();
-                    _drawTVBGoneFrame();
-                    return;
-                case TvbgState::Running:
-                    _tvbgState = TvbgState::Paused;
-                    _tvbgPaused = true;
-                    _device->led.setColor(WS2812B_Class::YELLOW);
-                    _drawTVBGoneFooter();
-                    _drawTVBGoneFrame();
-                    return;
-                case TvbgState::Paused:
-                    /* Send 1 — transmit currently displayed signal once */
-                    if (_tvbgIdx >= 0 && _tvbgIdx < _tvbgTotal) {
-                        int rawIdx = _univBlastQ.empty() ? _tvbgIdx : _univBlastQ[_tvbgIdx];
-                        _txSignal(_currentRemote.signals[rawIdx]);
-                        _device->led.setColor(WS2812B_Class::GREEN);
-                        delay(80);
-                        _device->led.setColor(WS2812B_Class::YELLOW);
-                    }
-                    return;
-            }
-        }
-
-        if (_tvbgState != TvbgState::Running) return;
-
-        /* Auto-iterate: send next signal every _tvbgGapMs */
-        if (_tvbgIdx >= _tvbgTotal) {
-            /* Done — return to Idle, leave idx at end so user can replay */
-            _tvbgState = TvbgState::Idle;
-            _device->led.setColor(WS2812B_Class::GREEN);
-            _drawTVBGoneFooter();
-            _drawTVBGoneFrame();
-            delay(600);
-            _device->led.off();
+            _switchScene(IrScene::UniversalMenu, false);
             return;
         }
 
-        unsigned long now = millis();
-        if (now - _tvbgLastSend < _tvbgGapMs) return;
-        _tvbgLastSend = now;
+        int n = 0;
+        if (known) {
+            n = kVBtnsCount[_univCat];
+            if (_univCat == kUnivCatTV) n++;
+        } else {
+            n = (int)_rows.size();
+        }
+        if (n <= 0) return;
 
-        int rawIdx = _univBlastQ.empty() ? _tvbgIdx : _univBlastQ[_tvbgIdx];
-        _txSignal(_currentRemote.signals[rawIdx]);
-        _tvbgIdx++;
-        _drawTVBGoneFrame();
+        if (known) {
+            const VBtnDef* btns = kVBtnsDefs[_univCat];
+            int rows = (n + 1) / 2;
+            int old  = _vbSel;
+            int row  = _vbSel / 2;
+            int col  = _vbSel % 2;
+            if (_device->button.Up.pressed())    row = (row - 1 + rows) % rows;
+            if (_device->button.Down.pressed())  row = (row + 1) % rows;
+            if (_device->button.Left.pressed())  col = (col - 1 + 2) % 2;
+            if (_device->button.Right.pressed()) col = (col + 1) % 2;
+            int sel = row * 2 + col;
+            if (sel >= n) sel = n - 1;
+            if (sel != old) {
+                _vbSel = sel;
+                int bx, by, bw, bh;
+                const char* lo = (_univCat == kUnivCatTV && old == n - 1) ? kTvbgLabel : btns[old].label;
+                const char* ln = (_univCat == kUnivCatTV && sel == n - 1) ? kTvbgLabel : btns[sel].label;
+                _getVBtnRect(old, n, bx, by, bw, bh);
+                hp::drawVirtualButton(Lcd, bx, by, bw, bh, lo, false);
+                _getVBtnRect(sel, n, bx, by, bw, bh);
+                hp::drawVirtualButton(Lcd, bx, by, bw, bh, ln, true);
+            }
+        } else {
+            if (_navList()) { _vbSel = _sel; _selUnivCat = _sel; _drawRows(); }
+        }
+
+        if (!_device->button.A.pressed()) return;
+
+        /* Build the blast queue from the index — one entry parsed at a time. */
+        _blastOffsets.clear();
+        _blastIsTvbg = false;
+        if (known && _univCat == kUnivCatTV && _vbSel == n - 1) {
+            _blastOffsets = _univIndex.all;                  /* TV-B-Gone */
+            _blastIsTvbg  = true;
+            strncpy(_blastName, kTvbgLabel, sizeof(_blastName) - 1);
+        } else {
+            const char* label;
+            int slot;
+            if (known) {
+                const VBtnDef& def = kVBtnsDefs[_univCat][_vbSel];
+                label = def.label;
+                slot  = univFindAlias(_univIndex, def);
+            } else {
+                label = _rows[_sel].c_str();
+                slot  = _univIndex.find(label);
+            }
+            if (slot < 0) {
+                _toast("No signals: %s", label);
+                return;
+            }
+            _blastOffsets = _univIndex.offsets[slot];
+            strncpy(_blastName, label, sizeof(_blastName) - 1);
+        }
+        _blastName[sizeof(_blastName) - 1] = '\0';
+        _switchScene(IrScene::Blast);
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  Sending overlay (brief)
+     *  Blast — iterate offsets, one signal in memory at a time
      * ════════════════════════════════════════════════════════════ */
 
-    void App09::_enterSending()
+    /* One line inside a 268 px popup: "12/815 brands · gap 1.0s". */
+    void App09::_blastDetail(char* out, size_t n) const
     {
-        _sendStart = millis();
-        _drawMsgBox(_sendLabel ? _sendLabel : "Sending...");
+        const int total = (int)_blastOffsets.size();
+        const char* gap = _blastIsTvbg ? "0.25"
+                                       : ((_sweepGapMs == kGapFast) ? "0.25" : "1.0");
+        if (_blastSkipped > 0)
+            snprintf(out, n, "%d/%d · skip %d · gap %ss",
+                     _blastPos, total, _blastSkipped, gap);
+        else
+            snprintf(out, n, "%d/%d brands · gap %ss", _blastPos, total, gap);
     }
 
-    void App09::_runSending()
+    void App09::_enterBlast()
     {
-        if (millis() - _sendStart > 500) {
-            _switchScene(_prevScene);
+        auto& Lcd = _device->Lcd;
+        /* A real entry rearms the queue; a repaint (expiring toast) or a resume
+         * from Identify only redraws, so a sweep is never restarted mid-flight. */
+        if (!_repaintOnly && !_blastResume) {
+            _blastPos     = 0;
+            _blastSkipped = 0;
+            _blastDone    = false;
+            _blastDoneAt  = 0;
+            _blastLast    = 0;
+            _blastCursor  = 0;
+        }
+        _blastResume = false;
+
+        if (_blastIsTvbg) hp::drawFooter4(Lcd, nullptr, nullptr, nullptr, "[B]Pause");
+        else              hp::drawFooter4(Lcd, "[<>]Gap", nullptr, nullptr, "[B]Pause");
+        if (!_blastDone) _device->led.setColor(WS2812B_Class::RED);
+
+        const int total = (int)_blastOffsets.size();
+        char detail[48];
+        _blastDetail(detail, sizeof(detail));
+        hp::drawProgressPopup(Lcd, _blastName, detail,
+                              total > 0 ? (float)_blastPos / (float)total : 0.0f,
+                              _blastDone ? hp::COL_FG : hp::COL_WARN);
+    }
+
+    void App09::_runBlast()
+    {
+        auto& Lcd = _device->Lcd;
+        const int total = (int)_blastOffsets.size();
+
+        if (_device->button.B.pressed()) {          /* pause -> Identify */
+            if (_blastDone) {
+                _device->led.off();
+                _univCloseFile();
+                _switchScene(IrScene::UniversalCat, false);
+                return;
+            }
+            if (_blastPos == 0) {          /* nothing sent yet: plain stop */
+                _device->led.off();
+                _univCloseFile();
+                _switchScene(IrScene::UniversalCat, false);
+                return;
+            }
+            _blastCursor = _blastPos - 1;   /* the entry that was just sent */
+            _switchScene(IrScene::Identify);
+            return;
+        }
+
+        /* Left/Right retune the sweep while it runs; the choice sticks for the
+         * rest of the app session. TV-B-Gone stays at its fixed 250 ms. */
+        if (!_blastDone && !_blastIsTvbg &&
+            (_device->button.Left.pressed() || _device->button.Right.pressed())) {
+            _sweepGapMs = (_sweepGapMs == kGapSlow) ? kGapFast : kGapSlow;
+            char detail[48];
+            _blastDetail(detail, sizeof(detail));
+            hp::drawProgressPopup(Lcd, _blastName, detail,
+                                  total > 0 ? (float)_blastPos / (float)total : 0.0f,
+                                  hp::COL_WARN);
+        }
+
+        if (_blastDone) {
+            if (millis() - _blastDoneAt > 1200) {
+                _device->led.off();
+                _univCloseFile();
+                _switchScene(IrScene::UniversalCat, false);
+            }
+            return;
+        }
+
+        if (_blastPos >= total) {
+            _blastDone   = true;
+            _blastDoneAt = millis();
+            _device->led.setColor(WS2812B_Class::GREEN);
+            hp::drawProgressPopup(Lcd, _blastName, "No more brands", 1.0f, hp::COL_FG);
+            return;
+        }
+
+        const uint32_t gapMs = _blastIsTvbg ? kTvbgGapMs : _sweepGapMs;
+        uint32_t now = millis();
+        if (_blastLast != 0 && now - _blastLast < gapMs) return;
+        _blastLast = now;
+
+        if (_univRead(_blastOffsets[_blastPos], _lastSent)) {
+            if (!_txSignal(_lastSent)) _blastSkipped++;
+        } else {
+            _blastSkipped++;
+        }
+        _blastCursor = _blastPos;
+        _blastPos++;
+
+        char detail[48];
+        _blastDetail(detail, sizeof(detail));
+        hp::drawProgressPopup(Lcd, _blastName, detail,
+                              (float)_blastPos / (float)(total > 0 ? total : 1),
+                              hp::COL_WARN);
+    }
+
+    /* One handle serves a whole sweep / Identify session: the alternative is
+     * an SD open+close for every transmitted entry. */
+    bool App09::_univRead(uint32_t offset, irstore::Signal& out, bool skipRawBody)
+    {
+        if (!_univFileOpen) {
+            _univFile = SD_MMC.open(_univPath, FILE_READ);
+            if (!_univFile) { out.reset(); return false; }
+            _univFileOpen = true;
+        }
+        return irstore::readEntryAt(_univFile, offset, out, skipRawBody);
+    }
+
+    void App09::_univCloseFile()
+    {
+        if (_univFileOpen) {
+            _univFile.close();
+            _univFileOpen = false;
         }
     }
 
     /* ════════════════════════════════════════════════════════════
-     *  IR hardware helpers
+     *  Identify — the sweep is paused on one entry
+     * ════════════════════════════════════════════════════════════ */
+
+    void App09::_identifySummary(char* out, size_t n) const
+    {
+        if (_lastSent.isRaw) {
+            snprintf(out, n, "RAW · %d samples", (int)_lastSent.raw.size());
+            return;
+        }
+        const char* proto = (_lastSent.proto == irfc::Proto::Unknown && _lastSent.protoRaw[0])
+                            ? _lastSent.protoRaw : irfc::protoName(_lastSent.proto);
+        snprintf(out, n, "%s  A:%02lX  C:%02lX", proto,
+                 (unsigned long)_lastSent.address, (unsigned long)_lastSent.command);
+    }
+
+    void App09::_enterIdentify()
+    {
+        auto& Lcd = _device->Lcd;
+        _rows.clear();
+        _subs.clear();
+        for (int i = 0; i < kIdentCount; i++) _rows.push_back(kIdentItems[i]);
+
+        char title[48];
+        snprintf(title, sizeof(title), "%s · #%d/%d", _blastName,
+                 _blastCursor + 1, (int)_blastOffsets.size());
+
+        hp::drawChrome(Lcd);
+        hp::drawHeader(Lcd, title, "HOLD", hp::COL_WARN);
+        hp::clearContent(Lcd);
+        hp::drawFooter4(Lcd, "[^v]Move", "[A]Select", nullptr, "[B]Stop");
+        if (!_repaintOnly) _device->led.setColor(WS2812B_Class::YELLOW);
+
+        char summary[48];
+        _identifySummary(summary, sizeof(summary));
+        Lcd.setFont(&fonts::efontCN_16);
+        Lcd.setTextColor(hp::COL_ACCENT, hp::COL_BG);
+        Lcd.setCursor(hp::PAD_X + 8, MENU_Y0 + 4);
+        Lcd.print(summary);
+
+        _drawIdentRows(Lcd, _sel);
+    }
+
+    /* Move the cursor and (optionally) transmit what it now points at. */
+    void App09::_identifyGoto(int index, bool send)
+    {
+        const int total = (int)_blastOffsets.size();
+        if (total <= 0) return;
+        if (index < 0) index = 0;
+        if (index >= total) index = total - 1;
+        /* Commit the move only when the entry could actually be read, so a
+         * failed read never leaves the cursor on a blank _lastSent. */
+        irstore::Signal next;
+        if (!_univRead(_blastOffsets[index], next)) {
+            _toast("Read failed");
+            _redraw();
+            return;
+        }
+        _blastCursor = index;
+        _lastSent    = std::move(next);
+        if (send) _sendOrToast(_lastSent, "Sent");
+        _redraw();
+    }
+
+    void App09::_runIdentify()
+    {
+        if (_navList()) _drawIdentRows(_device->Lcd, _sel);
+
+        if (_device->button.A.pressed()) {
+            switch (_sel) {
+                case 0: _sendOrToast(_lastSent, "Sent");               break;
+                case 1: _identifyGoto(_blastCursor - 1, true);         break;
+                case 2: _identifyGoto(_blastCursor + 1, true);         break;
+                case 3: {
+                    _device->led.off();          /* the sweep is over for now */
+                    _defaultDeviceName(_editBuf, sizeof(_editBuf));
+                    _vkSel       = 0;
+                    _nameMode    = IrNameMode::SaveAsDevice;
+                    _nameFromDup = false;
+                    _switchScene(IrScene::NameEditor);
+                    break;
+                }
+                case 4:                                  /* resume from cursor */
+                    _blastPos    = _blastCursor + 1;
+                    _blastLast   = millis();
+                    _blastResume = true;
+                    _switchScene(IrScene::Blast, false);
+                    break;
+                default:
+                    _device->led.off();
+                    _univCloseFile();
+                    _switchScene(IrScene::UniversalCat, false);
+                    break;
+            }
+            return;
+        }
+
+        if (_device->button.B.pressed()) {
+            _device->led.off();
+            _univCloseFile();
+            _switchScene(IrScene::UniversalCat, false);
+        }
+    }
+
+    /* "TV_NEC_04" — category, protocol, address. */
+    void App09::_defaultDeviceName(char* out, size_t n) const
+    {
+        char raw[64];
+        if (_lastSent.isRaw) {
+            snprintf(raw, sizeof(raw), "%s_RAW", _univTitle);
+        } else {
+            const char* proto = (_lastSent.proto == irfc::Proto::Unknown && _lastSent.protoRaw[0])
+                                ? _lastSent.protoRaw : irfc::protoName(_lastSent.proto);
+            snprintf(raw, sizeof(raw), "%s_%s_%02lX", _univTitle, proto,
+                     (unsigned long)_lastSent.address);
+        }
+        irstore::sanitiseName(raw, out, n);
+    }
+
+    /* Collect every entry of the category file that shares the identified
+     * entry's protocol AND address — in a brand-less library that is "the same
+     * remote" — keeping the first occurrence of each button name. */
+    void App09::_saveIdentifiedDevice(const char* stem)
+    {
+        auto& Lcd = _device->Lcd;
+        char path[168];
+        irstore::devicePath(stem, path, sizeof(path));
+        if (SD_MMC.exists(path)) { _toast("Name exists"); return; }
+
+        std::vector<irstore::Signal> out;
+
+        /* Name it before anything else: the dedupe below matches on the name. */
+        if (!_lastSent.name[0])
+            strncpy(_lastSent.name, "BTN_1", sizeof(_lastSent.name) - 1);
+
+        if (_lastSent.isRaw) {
+            out.push_back(_lastSent);
+            _univCloseFile();
+            if (!irstore::writeFile(path, out)) { _toast("Save failed"); return; }
+            _openDevice(stem, 0);
+            _toast("RAW: only this button saved");
+            return;
+        }
+
+        hp::drawLoadingBegin(Lcd, "Scanning library...", _univTitle);
+
+        /* The confirmed entry goes in first, so it — not an earlier same-named
+         * entry of the same (protocol, address) group carrying a different
+         * command — is the one that keeps its button name. */
+        out.push_back(_lastSent);
+
+        bool aborted = false;
+        const size_t total = _univIndex.all.size();
+        for (size_t i = 0; i < total; i++) {
+            if ((i & 0x0F) == 0) {
+                _device->button.update();
+                _device->button.tick();
+                if (_device->button.B.isLongPress()) { aborted = true; break; }
+                hp::drawLoadingTick(Lcd, (uint32_t)i);
+            }
+            irstore::Signal sig;
+            if (!_univRead(_univIndex.all[i], sig, true))  continue;  /* skip raw bodies */
+            if (sig.isRaw)                                continue;
+            if (sig.proto   != _lastSent.proto)           continue;
+            if (sig.address != _lastSent.address)         continue;
+            /* Two different unmapped protocol names both parse to Unknown. */
+            if (sig.proto == irfc::Proto::Unknown &&
+                strcasecmp(sig.protoRaw, _lastSent.protoRaw) != 0) continue;
+            if (irstore::findSignal(out, sig.name) >= 0)  continue;  /* first wins */
+            out.push_back(std::move(sig));
+        }
+        _univCloseFile();
+        _drainInput();
+
+        if (aborted) {
+            /* The abort press must not also trip the app-wide exit check. */
+            _waitButtonsReleased();
+            _redraw();
+            return;
+        }
+        if (out.empty()) { _toast("Nothing to save"); _redraw(); return; }
+        if (!irstore::writeFile(path, out)) { _toast("Save failed"); _redraw(); return; }
+
+        _openDevice(stem, 0);
+        _toast("Saved %d buttons", (int)out.size());
+    }
+
+    /* ════════════════════════════════════════════════════════════
+     *  IR hardware
      * ════════════════════════════════════════════════════════════ */
 
     void App09::_startRx()
     {
         _stopRx();
-        _irRecv = new IRrecv(HAL_PIN_IR_RX, 1024, 50, true);
+        /* 2048 entries is the raw capture limit: an AC frame pair
+         * (2 x ~850 timings) must fit inside the 50 ms idle timeout. */
+        _irRecv = new IRrecv(HAL_PIN_IR_RX, 2048, 50, true);
         _irRecv->enableIRIn();
     }
 
@@ -1402,279 +2009,72 @@ namespace MOONCAKE::APPS
         }
     }
 
-    void App09::_txSignal(const IrSignal& sig)
+    /* The single transmit funnel: every parsed signal leaves through here. */
+    void App09::_txFrame(const irfc::TxFrame& f)
     {
         if (!_irSend) return;
+        /* .ir files carry no RC5/RC6 toggle bit; like Flipper's encoder we flip
+         * it on every transmission so receivers see distinct key presses
+         * (protocol map §3.9/§3.11: RC5/RC5X bit 11, RC6 mode-0 bit 16). */
+        const uint64_t rcToggle = _rcToggle ? 1 : 0;
+        _rcToggle = !_rcToggle;
+        /* Repeat counts follow Flipper's per-protocol minimum frame count
+         * (protocol map §0.5): SIRC 3 frames = library default repeat 2,
+         * Pioneer 2 frames = repeat 1, everything else a single frame. */
+        switch (f.kind) {
+            case irfc::TxKind::NEC:         _irSend->sendNEC(f.data, f.nbits);         break;
+            case irfc::TxKind::SAMSUNG:     _irSend->sendSAMSUNG(f.data, f.nbits);     break;
+            case irfc::TxKind::SONY:        _irSend->sendSony(f.data, f.nbits, kSonyMinRepeat); break;
+            case irfc::TxKind::RC5:         _irSend->sendRC5(f.data | (rcToggle << 11), f.nbits); break;
+            case irfc::TxKind::RC6:         _irSend->sendRC6(f.data | (rcToggle << 16), f.nbits); break;
+            case irfc::TxKind::PANASONIC64: _irSend->sendPanasonic64(f.data, f.nbits); break;
+            case irfc::TxKind::PIONEER:     _irSend->sendPioneer(f.data, f.nbits, 1);  break;
+            case irfc::TxKind::SANYO_LC7461:
+                _irSend->sendSanyoLC7461(f.data, f.nbits);                             break;
+            case irfc::TxKind::GENERIC_RCA: {
+                const irfc::GenericTiming& t = irfc::rcaTiming();
+                _irSend->sendGeneric(t.hdrMark, t.hdrSpace,
+                                     t.oneMark, t.oneSpace,
+                                     t.zeroMark, t.zeroSpace,
+                                     t.footerMark, t.gapUs,
+                                     f.data, f.nbits, t.khz, t.msbFirst,
+                                     (uint16_t)0, (uint8_t)33);
+                break;
+            }
+            default: break;
+        }
+    }
+
+    bool App09::_txSignal(const irstore::Signal& sig)
+    {
+        if (!_irSend) return false;
 
         if (sig.isRaw) {
-            if (!sig.rawData.empty()) {
-                _irSend->sendRaw(sig.rawData.data(), sig.rawData.size(),
-                                 sig.frequency / 1000);
-            }
-        } else {
-            _irSend->send(sig.protocol, sig.value, sig.bits);
-        }
-    }
-
-    /* ════════════════════════════════════════════════════════════
-     *  File I/O — Flipper-compatible .ir format
-     *
-     *  Format:
-     *    Filetype: IR signals file
-     *    Version: 1
-     *    #
-     *    name: Power
-     *    type: parsed
-     *    protocol: NEC
-     *    address: 04 00
-     *    command: 08 00
-     *    #
-     *    name: RawSignal
-     *    type: raw
-     *    frequency: 38000
-     *    duty_cycle: 0.330000
-     *    data: 9024 4512 564 564 ...
-     * ════════════════════════════════════════════════════════════ */
-
-    static const struct { const char* name; decode_type_t type; } kProtoMap[] = {
-        { "NEC",       NEC       },
-        { "NECext",    NEC       },
-        { "Samsung32", SAMSUNG   },
-        { "SAMSUNG",   SAMSUNG   },
-        { "RC5",       RC5       },
-        { "RC5X",      RC5X      },
-        { "RC6",       RC6       },
-        { "Sony",      SONY      },
-        { "SIRC",      SONY      },
-        { "SIRC15",    SONY      },
-        { "SIRC20",    SONY      },
-        { "Panasonic", PANASONIC },
-        { "Kaseikyo",  PANASONIC },
-        { "LG",        LG        },
-        { "LG32",      LG        },
-        { "JVC",       JVC       },
-        { "PIONEER",   PIONEER   },
-        { "SHARP",     SHARP     },
-    };
-    static constexpr int kProtoMapSize = sizeof(kProtoMap) / sizeof(kProtoMap[0]);
-
-    static decode_type_t flipperProtoToType(const char* name) {
-        for (int i = 0; i < kProtoMapSize; i++) {
-            if (strcasecmp(name, kProtoMap[i].name) == 0) return kProtoMap[i].type;
-        }
-        return UNKNOWN;
-    }
-
-    static const char* typeToFlipperProto(decode_type_t t) {
-        for (int i = 0; i < kProtoMapSize; i++) {
-            if (kProtoMap[i].type == t) return kProtoMap[i].name;
-        }
-        return "UNKNOWN";
-    }
-
-    static uint32_t parseHexBytes(const char* s) {
-        uint32_t result = 0;
-        int shift = 0;
-        const char* p = s;
-        while (*p) {
-            while (*p == ' ') p++;
-            if (!*p) break;
-            char* end;
-            uint32_t byte = strtoul(p, &end, 16);
-            result |= (byte << shift);
-            shift += 8;
-            p = end;
-        }
-        return result;
-    }
-
-    static void formatHexBytes(uint32_t val, int nbytes, char* out, int outSize) {
-        int pos = 0;
-        for (int i = 0; i < nbytes && pos < outSize - 3; i++) {
-            if (i > 0) out[pos++] = ' ';
-            uint8_t b = (val >> (i * 8)) & 0xFF;
-            pos += snprintf(out + pos, outSize - pos, "%02X", b);
-        }
-        out[pos] = '\0';
-    }
-
-    static void writeSignalEntry(File& f, const IrSignal& sig)
-    {
-        f.printf("name: %s\n", sig.name);
-
-        if (sig.isRaw) {
-            f.println("type: raw");
-            f.printf("frequency: %lu\n", sig.frequency);
-            f.println("duty_cycle: 0.330000");
-            f.print("data:");
-            for (size_t i = 0; i < sig.rawData.size(); i++) {
-                f.printf(" %u", sig.rawData[i]);
-            }
-            f.println();
-        } else {
-            f.println("type: parsed");
-            f.printf("protocol: %s\n", typeToFlipperProto(sig.protocol));
-
-            char addrBuf[32], cmdBuf[32];
-            int nbytes = (sig.bits + 7) / 8;
-            if (nbytes < 2) nbytes = 2;
-            if (nbytes > 4) nbytes = 4;
-            formatHexBytes(sig.address, nbytes, addrBuf, sizeof(addrBuf));
-            formatHexBytes(sig.command, nbytes, cmdBuf, sizeof(cmdBuf));
-            f.printf("address: %s\n", addrBuf);
-            f.printf("command: %s\n", cmdBuf);
-        }
-    }
-
-    bool App09::_loadRemote(const char* path, IrRemote& remote, int maxSignals, const char* filterName)
-    {
-        File f = SD_MMC.open(path, FILE_READ);
-        if (!f) return false;
-
-        remote.signals.clear();
-        strncpy(remote.path, path, sizeof(remote.path) - 1);
-        remote.path[sizeof(remote.path) - 1] = '\0';
-
-        const char* slash = strrchr(path, '/');
-        const char* name = slash ? slash + 1 : path;
-        strncpy(remote.filename, name, sizeof(remote.filename) - 1);
-        remote.filename[sizeof(remote.filename) - 1] = '\0';
-        char* dot = strrchr(remote.filename, '.');
-        if (dot) *dot = '\0';
-
-        /* Reset a signal in-place WITHOUT memsetting over the std::vector
-         * member.  memset over a vector silently orphans its heap allocation
-         * and was the root cause of "second SD load fails" — the heap was
-         * being leaked one signal at a time on every reload. */
-        auto resetSig = [](IrSignal& s) {
-            s.rawData.clear();
-            s.name[0]   = '\0';
-            s.isRaw     = false;
-            s.protocol  = UNKNOWN;
-            s.value     = 0;
-            s.bits      = 0;
-            s.address   = 0;
-            s.command   = 0;
-            s.frequency = 38000;
-        };
-
-        IrSignal sig;
-        resetSig(sig);
-        bool inSignal = false;
-        String line;
-
-        while (f.available()) {
-            /* Stop early if signal cap reached (only when no name filter is
-             * active — filtered loads are inherently bounded by brand count). */
-            if (!filterName && maxSignals > 0 && (int)remote.signals.size() >= maxSignals) break;
-
-            line = f.readStringUntil('\n');
-            line.trim();
-
-            if (line.startsWith("name: ")) {
-                if (inSignal) {
-                    /* When filtering, only keep signals whose name matches. */
-                    if (!filterName || strcasecmp(sig.name, filterName) == 0) {
-                        remote.signals.push_back(std::move(sig));
-                    }
-                }
-                resetSig(sig);
-                strncpy(sig.name, line.c_str() + 6, sizeof(sig.name) - 1);
-                sig.name[sizeof(sig.name) - 1] = '\0';
-                inSignal = true;
-            }
-            else if (line.startsWith("type: ")) {
-                String t = line.substring(6);
-                t.trim();
-                sig.isRaw = (t == "raw");
-            }
-            else if (line.startsWith("protocol: ")) {
-                String proto = line.substring(10);
-                proto.trim();
-                sig.protocol = flipperProtoToType(proto.c_str());
-            }
-            else if (line.startsWith("address: ")) {
-                sig.address = parseHexBytes(line.c_str() + 9);
-            }
-            else if (line.startsWith("command: ")) {
-                sig.command = parseHexBytes(line.c_str() + 9);
-                if (!sig.isRaw) {
-                    sig.bits = 32;
-                    sig.value = ((uint64_t)sig.address) | ((uint64_t)sig.command << 16);
-                }
-            }
-            else if (line.startsWith("frequency: ")) {
-                sig.frequency = line.substring(11).toInt();
-            }
-            else if (line.startsWith("data: ")) {
-                const char* p = line.c_str() + 6;
-                while (*p) {
-                    while (*p == ' ') p++;
-                    if (!*p) break;
-                    char* end;
-                    long val = strtol(p, &end, 10);
-                    if (end == p) break;
-                    sig.rawData.push_back((uint16_t)val);
-                    p = end;
-                }
-            }
+            if (sig.raw.empty()) return false;
+            /* enableIROut() accepts Hz as well as kHz, so the stored carrier
+             * is passed through unrounded (36700 Hz would become 36 kHz). */
+            uint32_t hz = sig.frequency ? sig.frequency : 38000;
+            _irSend->sendRaw(sig.raw.data(), (uint16_t)sig.raw.size(), (uint16_t)hz);
+            return true;
         }
 
-        if (inSignal) {
-            if (!filterName || strcasecmp(sig.name, filterName) == 0) {
-                remote.signals.push_back(std::move(sig));
-            }
-        }
+        irfc::Flipper fl;
+        fl.proto   = sig.proto;
+        fl.address = sig.address;
+        fl.command = sig.command;
 
-        f.close();
+        irfc::TxFrame frame;
+        if (!irfc::toTx(fl, frame)) return false;   /* no codec mapping */
+        _txFrame(frame);
         return true;
     }
 
-    bool App09::_saveSignalToFile(const char* dir, const char* remoteName, const IrSignal& sig)
+    void App09::_sendOrToast(const irstore::Signal& sig, const char* sentLabel)
     {
-        char path[128];
-        snprintf(path, sizeof(path), "%s/%s.ir", dir, remoteName);
-
-        File f = SD_MMC.open(path, FILE_WRITE);
-        if (!f) return false;
-
-        f.println("Filetype: IR signals file");
-        f.println("Version: 1");
-        f.println("#");
-        writeSignalEntry(f, sig);
-        f.close();
-        return true;
+        if (_txSignal(sig)) { _toast("%s", sentLabel); return; }
+        if (sig.isRaw) { _toast("Empty signal"); return; }
+        _toast("Unsupported: %s",
+               (sig.proto == irfc::Proto::Unknown && sig.protoRaw[0])
+                   ? sig.protoRaw : irfc::protoName(sig.proto));
     }
-
-    bool App09::_appendSignalToFile(const char* path, const IrSignal& sig)
-    {
-        File f = SD_MMC.open(path, FILE_APPEND);
-        if (!f) return false;
-
-        f.println("#");
-        writeSignalEntry(f, sig);
-        f.close();
-        return true;
-    }
-
-    void App09::_listIrFiles(const char* dir, std::vector<String>& out)
-    {
-        File root = SD_MMC.open(dir);
-        if (!root || !root.isDirectory()) return;
-
-        File file = root.openNextFile();
-        while (file) {
-            if (!file.isDirectory()) {
-                String name = file.name();
-                if (name.endsWith(".ir") || name.endsWith(".IR")) {
-                    const char* slash = strrchr(file.name(), '/');
-                    out.push_back(slash ? String(slash + 1) : name);
-                }
-            }
-            file.close();
-            file = root.openNextFile();
-        }
-        root.close();
-    }
-
 }  /* namespace MOONCAKE::APPS */
