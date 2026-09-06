@@ -74,7 +74,7 @@ static bool s_screen_off = false;
 static bool _screen_transition_active()
 {
     lv_disp_t* disp = lv_disp_get_default();
-    return disp != nullptr && disp->scr_to_load != nullptr;
+    return disp != nullptr && lv_disp_get_scr_prev(disp) != nullptr;
 }
 
 static const char* _screen_name(const lv_obj_t* screen)
@@ -803,12 +803,17 @@ void Launcher::handleNavigationEvent(mk_event_t evt)
             }
             return;
         }
-        return;
+        if (!a) {
+            return;
+        }
     }
 
     /* ── Fallback: A → Home ── */
     if (a && cur != ui_apps_menu && cur != ui_settings &&
              cur != ui_sd_card_files && cur != ui_clock) {
+        Serial.printf("[Launcher] Navigation %s -> home (event=0x%02X, heap=%lu)\n",
+                      _screen_name(cur), (unsigned)evt,
+                      (unsigned long)esp_get_free_heap_size());
         _ui_screen_change(&ui_home, LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, &ui_home_screen_init);
     }
 }
