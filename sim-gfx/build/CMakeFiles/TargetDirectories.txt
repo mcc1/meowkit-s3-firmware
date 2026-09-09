@@ -1,3 +1,0 @@
-/home/kdelfour/Workspace/Contributions/meowkit-s3-firmware/sim-gfx/build/CMakeFiles/vu-face.dir
-/home/kdelfour/Workspace/Contributions/meowkit-s3-firmware/sim-gfx/build/CMakeFiles/edit_cache.dir
-/home/kdelfour/Workspace/Contributions/meowkit-s3-firmware/sim-gfx/build/CMakeFiles/rebuild_cache.dir
