@@ -62,10 +62,14 @@ void vu_face_draw(LovyanGFX* gfx, int32_t ox, int32_t oy)
 
     /* Pourtour, puis panneau vert uni cerné d'un cadre fin — l'illustration
      * d'origine repose sur le même principe, un panneau coloré dans un biseau. */
+    /* Encadrement repris de l'illustration d'origine, mesuré dessus :
+     * panneau x=40..279, y=14..208 — encastré, et non plein écran. */
+    constexpr int32_t PX = 40, PY = 14, PW = 240, PH = 195, PR = 12;
+
     gfx->fillRect(ox, oy, 320, 240, rgb(gfx, COL_BG));
-    gfx->fillSmoothRoundRect(ox + 8, oy + 8, 304, 224, 12, rgb(gfx, COL_PANEL));
-    gfx->drawRoundRect(ox + 8, oy + 8, 304, 224, 12, rgb(gfx, COL_FRAME));
-    gfx->drawRoundRect(ox + 9, oy + 9, 302, 222, 11, rgb(gfx, COL_FRAME));
+    gfx->fillSmoothRoundRect(ox + PX, oy + PY, PW, PH, PR, rgb(gfx, COL_PANEL));
+    gfx->drawRoundRect(ox + PX, oy + PY, PW, PH, PR, rgb(gfx, COL_FRAME));
+    gfx->drawRoundRect(ox + PX - 1, oy + PY - 1, PW + 2, PH + 2, PR + 1, rgb(gfx, COL_FRAME));
 
     /* L'arc gradué, en deux teintes : nominale puis crête. */
     const int32_t cx = ox + (int32_t)PIVOT_X;
@@ -86,7 +90,7 @@ void vu_face_draw(LovyanGFX* gfx, int32_t ox, int32_t oy)
         const float ang    = dbToAngle(db);
 
         int32_t x0, y0, x1, y1;
-        polar(ang, major ? R_TICK_IN : R_TICK_IN + 8.0f, ox, oy, x0, y0);
+        polar(ang, major ? R_TICK_IN : R_TICK_IN + 9.0f, ox, oy, x0, y0);
         polar(ang, R_SCALE - 4.0f, ox, oy, x1, y1);
         gfx->drawWideLine(x0, y0, x1, y1, major ? 2.5f : 1.2f, col);
 
@@ -94,7 +98,7 @@ void vu_face_draw(LovyanGFX* gfx, int32_t ox, int32_t oy)
             char buf[8];
             snprintf(buf, sizeof(buf), "%d", (int)-db);
             int32_t lx, ly;
-            polar(ang, R_TICK_IN - 13.0f, ox, oy, lx, ly);
+            polar(ang, R_SCALE + 13.0f, ox, oy, lx, ly);
             gfx->setTextColor(col);
             gfx->drawString(buf, lx, ly);
         }
@@ -102,10 +106,11 @@ void vu_face_draw(LovyanGFX* gfx, int32_t ox, int32_t oy)
 
     /* Le balayage est symétrique, le milieu de l'arc tombe donc sur l'axe. */
     gfx->setTextColor(rgb(gfx, COL_SCALE));
-    gfx->drawString("dB", ox + (int32_t)PIVOT_X, oy + 172);
+    gfx->drawString("dB", ox + (int32_t)PIVOT_X, oy + 160);
 
+    /* À l'intérieur du panneau, comme sur l'illustration d'origine. */
     gfx->setTextDatum(textdatum_t::bottom_left);
-    gfx->drawString("VU METER", ox + 26, oy + 222);
+    gfx->drawString("VU METER", ox + PX + 14, oy + PY + PH - 12);
     gfx->setTextDatum(textdatum_t::bottom_right);
-    gfx->drawString("PEAK", ox + 294, oy + 222);
+    gfx->drawString("PEAK", ox + PX + PW - 14, oy + PY + PH - 12);
 }
