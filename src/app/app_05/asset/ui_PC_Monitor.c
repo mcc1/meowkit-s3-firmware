@@ -188,13 +188,31 @@ void ui_PC_Monitor_screen_init(void)
     lv_obj_set_style_text_opa(ui_symbol_4, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_symbol_4, &ui_font_name_14, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    /* Le « % » est un libellé distinct, petit et blanc, exactement comme
+     * ui_symbol_2 et ui_symbol_4 le font pour les charges CPU et GPU. */
+    ui_mem_symbol = lv_label_create(ui_PC_Monitor);
+    lv_obj_set_width(ui_mem_symbol, LV_SIZE_CONTENT);
+    lv_obj_set_height(ui_mem_symbol, LV_SIZE_CONTENT);
+    lv_obj_set_x(ui_mem_symbol, 143);
+    lv_obj_set_y(ui_mem_symbol, -15);
+    lv_obj_set_align(ui_mem_symbol, LV_ALIGN_CENTER);
+    lv_label_set_text(ui_mem_symbol, "%");
+    lv_obj_set_style_text_color(ui_mem_symbol, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_opa(ui_mem_symbol, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_mem_symbol, &ui_font_name_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+
     ui_Image5 = lv_img_create(ui_PC_Monitor);
     lv_img_set_src(ui_Image5, &ui_img_temp2_full_png);
+    /* Découpage plutôt que mise à l'échelle, comme les barres horizontales. */
+    lv_img_set_size_mode(ui_Image5, LV_IMG_SIZE_MODE_REAL);
     lv_obj_set_width(ui_Image5, LV_SIZE_CONTENT);   /// 40
     lv_obj_set_height(ui_Image5, LV_SIZE_CONTENT);    /// 50
-    lv_obj_set_x(ui_Image5, 60);
-    lv_obj_set_y(ui_Image5, -25);
-    lv_obj_set_align(ui_Image5, LV_ALIGN_CENTER);
+    lv_obj_set_x(ui_Image5, 200);
+    lv_obj_set_y(ui_Image5, -120);
+    /* Ancré en bas : le dégradé va du rouge en haut au vert en bas, la jauge
+     * se remplit donc vers le haut. Bord bas conservé à y=120 (centre parent
+     * 120, y=-25, hauteur 50). */
+    lv_obj_set_align(ui_Image5, LV_ALIGN_BOTTOM_LEFT);
     lv_obj_add_flag(ui_Image5, LV_OBJ_FLAG_ADV_HITTEST);     /// Flags
     lv_obj_clear_flag(ui_Image5, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
 
@@ -227,9 +245,9 @@ void ui_PC_Monitor_screen_init(void)
     lv_obj_set_y(ui_mhz, -20);
     lv_obj_set_align(ui_mhz, LV_ALIGN_CENTER);
     lv_label_set_text(ui_mhz, "800Mhz");
-    lv_obj_set_style_text_color(ui_mhz, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(ui_mhz, lv_color_hex(0xA3DE00), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_mhz, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_mhz, &ui_font_name_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_mhz, &ui_font_pc_temp, LV_PART_MAIN | LV_STATE_DEFAULT);
 
 
 }
@@ -243,6 +261,7 @@ void ui_PC_Monitor_screen_init(void)
  * son sens de remplissage et son ancrage demandent une décision de design.)
  */
 #define GAUGE_W        100
+#define GAUGE_V_H       50   /* hauteur de la barre verticale (ui_Image5) */
 #define GAUGE_TEMP_MIN  30   /* °C — en dessous, barre vide */
 #define GAUGE_TEMP_MAX  90   /* °C — au-dessus, barre pleine */
 
@@ -280,6 +299,23 @@ static int gauge_temp_pct(int celsius)
     if (celsius <= GAUGE_TEMP_MIN) return 0;
     if (celsius >= GAUGE_TEMP_MAX) return 100;
     return ((celsius - GAUGE_TEMP_MIN) * 100) / (GAUGE_TEMP_MAX - GAUGE_TEMP_MIN);
+}
+
+/* Barre verticale : remplissage par le bas. Le mode REAL montre le haut de
+ * l'image ; on décale le contenu pour révéler sa partie basse, la verte. */
+static void gauge_set_vertical(lv_obj_t * bar, int pct)
+{
+    if (!bar) return;
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    int h = (GAUGE_V_H * pct) / 100;
+    lv_obj_set_height(bar, h);
+    lv_img_set_offset_y(bar, -(GAUGE_V_H - h));
+}
+
+void ui_pc_monitor_set_memory_gauge(int used_pct)
+{
+    gauge_set_vertical(ui_Image5, used_pct);
 }
 
 void ui_pc_monitor_set_gauges(int cpu_temp_c, int cpu_load_pct,

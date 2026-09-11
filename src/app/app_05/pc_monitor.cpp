@@ -122,10 +122,16 @@ void style_01(DEVICES* _device) {
   int cpuCoreClockEnd = inputString.indexOf("|", cpuCoreClockStart);
   String cpuClockString = inputString.substring(cpuCoreClockStart, cpuCoreClockEnd);
 
-  /*CPU Core Freq*/
+  /* Bloc « USED MEMORY » : l'en-tête imprimé dans l'image de fond annonce la
+   * mémoire utilisée, mais c'est la fréquence CPU qui y était affichée. Le
+   * libellé et la jauge verticale suivent désormais ce qui est écrit. La
+   * fréquence reste parsée ci-dessus ; la maquette ne lui offre aucun bloc. */
     {
-        String mhz = cpuClockString + String("MHz");
-        lv_label_set_text(ui_mhz, mhz.c_str());
+        int usedPct = (intRamSum > 0.0f) ? (int)((intRam * 100.0) / intRamSum) : 0;
+        char memBuf[16];
+        snprintf(memBuf, sizeof(memBuf), "%d", usedPct);
+        lv_label_set_text(ui_mhz, memBuf);
+        ui_pc_monitor_set_memory_gauge(usedPct);
     }
 
    //---------------------------------------------Total GPU Memory-----------------------------------------------------------
