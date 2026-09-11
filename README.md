@@ -21,6 +21,28 @@ These changes are provided so other MeowKit owners can inspect, reproduce, and
 adapt the work. Review the hardware and firmware risks before using a generated
 image.
 
+## Merged upstream pull requests
+
+Upstream `main` had no new commits as of 2026-09-11, but the open pull requests
+below were merged here (each as a `Merge upstream PR #N` commit) after a clean
+`esp32s3box` build and a passing host-test run:
+
+| PR | Change |
+| --- | --- |
+| #29 | Launcher: dispatch joystick navigation immediately and ignore input during screen transitions (fixes a navigation reboot) |
+| #31 | `sim/`: desktop LVGL simulator (SDL2) for reviewing UI screens without hardware |
+| #35 | Font: render the degree sign instead of a placeholder box |
+| #36 | Wi-Fi: truncate long SSIDs instead of wrapping out of the row |
+| #37–#40 | PC Monitor: gradient bars follow values, values coloured like their bar, correct USED MEMORY block, clear screen when the host stops sending |
+| #41 | VU Meter: procedural face when `/vu_meter/vu_meter_bg.png` is missing; adds the `sim-gfx/` LovyanGFX bench |
+| #42 | Settings: readable Factory Reset dialog |
+| #44 | Wi-Fi/Settings: label overflow fixes (already part of #29) |
+
+Not merged: #34 (`.gitmodules` — this fork already ships an identical one),
+#43 and #45 (written against the original `app_09` Infrared code; this fork's
+rewrite serialises `value`/`bits` through `ir_flipper_codec`, and the folder
+browser would have to be re-implemented on top of `ir_store`).
+
 ## Reproducible source checkout
 
 This repository records the firmware dependencies as Git submodules. After a
