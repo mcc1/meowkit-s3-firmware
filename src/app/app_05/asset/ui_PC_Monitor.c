@@ -246,6 +246,27 @@ void ui_PC_Monitor_screen_init(void)
 #define GAUGE_TEMP_MIN  30   /* °C — en dessous, barre vide */
 #define GAUGE_TEMP_MAX  90   /* °C — au-dessus, barre pleine */
 
+/* Le dégradé des barres n'est pas continu : c'est quatre bandes franches,
+ * relevées directement sur l'image. Le chiffre prend la couleur de la bande où
+ * tombe sa valeur, il s'accorde donc exactement avec la barre à côté de lui.
+ * L'écran WiFi emploie déjà ce procédé pour son pourcentage de signal. */
+static lv_color_t gauge_color(int pct)
+{
+    if (pct < 40) return lv_color_hex(0xBDE700);   /* vert lime */
+    if (pct < 60) return lv_color_hex(0xEFDF29);   /* jaune     */
+    if (pct < 80) return lv_color_hex(0xF78629);   /* orange    */
+    return lv_color_hex(0xF75129);                 /* rouge     */
+}
+
+static void value_set_color(lv_obj_t * label, int pct)
+{
+    if (!label) return;
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    lv_obj_set_style_text_color(label, gauge_color(pct),
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
 static void gauge_set(lv_obj_t * bar, int pct)
 {
     if (!bar) return;
@@ -264,8 +285,17 @@ static int gauge_temp_pct(int celsius)
 void ui_pc_monitor_set_gauges(int cpu_temp_c, int cpu_load_pct,
                               int gpu_temp_c, int gpu_load_pct)
 {
-    gauge_set(ui_temp2, gauge_temp_pct(cpu_temp_c));   /* température CPU */
+    int cpu_t_pct = gauge_temp_pct(cpu_temp_c);
+    int gpu_t_pct = gauge_temp_pct(gpu_temp_c);
+
+    gauge_set(ui_temp2, cpu_t_pct);                    /* température CPU */
     gauge_set(ui_temp1, cpu_load_pct);                 /* charge CPU      */
-    gauge_set(ui_temp3, gauge_temp_pct(gpu_temp_c));   /* température GPU */
+    gauge_set(ui_temp3, gpu_t_pct);                    /* température GPU */
     gauge_set(ui_temp4, gpu_load_pct);                 /* charge GPU      */
+
+    /* Le chiffre suit la couleur de sa barre, au lieu d'un vert lime figé. */
+    value_set_color(ui_cpu_temp,    cpu_t_pct);
+    value_set_color(ui_cpu_percent, cpu_load_pct);
+    value_set_color(ui_gpu_temp,    gpu_t_pct);
+    value_set_color(ui_gpu_percent, gpu_load_pct);
 }
